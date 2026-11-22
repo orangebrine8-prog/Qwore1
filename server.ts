@@ -1,22 +1,22 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
-import express, { NextFunction, Request, Response } from 'express';
+import fs from 'node:fs';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, GenerateContentResponse, ThinkingLevel, Type } from '@google/genai';
+import { GoogleGenAI, type GenerateContentResponse, ThinkingLevel, Type } from '@google/genai';
 import {
   QoweApiKeyStore,
   extractApiKeyFromHeaders,
-  PublicQoweApiKeyRecord,
-} from './server/apiKeyService';
-import { ApiEndpointCategory, QoweUsageTracker } from './server/apiUsageTracker';
-import { BaseUrlResolution, resolveBaseUrls } from './server/urlUtils';
+  type PublicQoweApiKeyRecord,
+} from './server/apiKeyService.ts';
+import { type ApiEndpointCategory, QoweUsageTracker } from './server/apiUsageTracker.ts';
+import { type BaseUrlResolution, resolveBaseUrls } from './server/urlUtils.ts';
 import {
   normalizeVideoSceneSpec,
   sanitizeGeneratedSvg,
-  VideoSceneSpec,
-} from './src/engine/intentAndMedia';
+  type VideoSceneSpec,
+} from './src/engine/intentAndMedia.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -923,18 +923,28 @@ app.use('/api', (_req, res) => {
 });
 
 async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+  const distDir = path.resolve(__dirname, 'dist');
+  const hasDistBuild = fs.existsSync(path.join(distDir, 'index.html'));
+  const isProd =
+    process.env.NODE_ENV === 'production' ||
+    process.env.RENDER === 'true' ||
+    (process.env.npm_lifecycle_event === 'start' && hasDistBuild);
+
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+      if (fs.existsSync(path.join(distDir, 'index.html'))) {
+        res.sendFile(path.join(distDir, 'index.html'));
+      } else {
+        res.status(503).send('Build output not found. Run npm run build first.');
+      }
     });
   }
 
