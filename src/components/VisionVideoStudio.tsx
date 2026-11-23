@@ -23,6 +23,7 @@ import {
   getBrowserWorkerCount,
   trainMultimodalPool,
 } from '../engine/workerClient';
+import type { LtxCinemaPayload } from '../engine/ltx25DiT';
 import type { NeuralAudioFrame } from '../utils/neuralAudioSynth';
 import { CanvasMediaPlayer } from './CanvasMediaPlayer';
 
@@ -62,6 +63,7 @@ interface ActivePreview {
   frames: Uint8ClampedArray[];
   audioTrack?: NeuralAudioFrame[];
   cameraMotion?: CameraMotionMode;
+  cinemaPayload?: LtxCinemaPayload;
 }
 
 export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
@@ -151,6 +153,7 @@ export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
                 frames: media.frames,
                 audioTrack: media.audioTrack,
                 cameraMotion: media.cameraMotion,
+                cinemaPayload: media.cinemaPayload,
               });
             })
             .catch((err) => {
@@ -212,6 +215,7 @@ export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
         frames: media.frames,
         audioTrack: media.audioTrack,
         cameraMotion: media.cameraMotion,
+        cinemaPayload: media.cinemaPayload,
       });
     } catch (err) {
       setWorkerError(err instanceof Error ? err.message : 'Synthesis failed.');
@@ -274,14 +278,14 @@ export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
         <div className="flex items-center gap-3 min-w-0">
           <div className="min-w-0">
             <h1 className="text-sm sm:text-base font-semibold text-neutral-900 dark:text-white truncate">
-              From-Scratch Audio &amp; 60 FPS Cinema Engine
+              Qowe LTX-2.5 Dual-Stream &amp; 60 FPS Cinema Engine
             </h1>
             <p className="text-xs text-neutral-500 dark:text-neutral-400 truncate tabular-nums">
-              Joint Audio-Visual Spatiotemporal Field
+              Rectified Flow 3D Raymarching
               <span aria-hidden="true"> · </span>
               {formatParamCount(paramCount)} trainable params
               <span aria-hidden="true"> · </span>
-              {workerCount}-Core AllReduce (zero external video APIs)
+              {workerCount}-Core AllReduce (Zero API Keys)
             </p>
           </div>
         </div>
@@ -503,9 +507,9 @@ export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
                   </button>
                 </div>
 
-                {/* Zero-GC Canvas Viewport */}
+                {/* Zero-GC WebGL2 3D PBR Cinema Viewport */}
                 <div className="rounded-2xl bg-[#f5f5f7] dark:bg-[#121214] p-4 flex flex-col items-center justify-center min-h-[300px]">
-                  {preview && preview.frames.length > 0 ? (
+                  {preview && (preview.frames.length > 0 || Boolean(preview.cinemaPayload)) ? (
                     <CanvasMediaPlayer
                       frames={preview.frames}
                       width={preview.width}
@@ -514,17 +518,18 @@ export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
                       label={preview.prompt}
                       audioTrack={preview.audioTrack}
                       cameraMotion={preview.cameraMotion}
+                      cinemaPayload={preview.cinemaPayload}
                       showScrubber={preview.kind === 'video'}
                     />
                   ) : (
                     <div className="text-center space-y-1.5 px-4">
                       <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
                         {isTraining
-                          ? `Training visual & audio heads across ${workerCount} workers...`
-                          : '16:9 60 FPS Cinema & Sound Viewport Ready'}
+                          ? `Training LTX-2.5 visual & audio heads across ${workerCount} workers...`
+                          : '960×540 60 FPS LTX-2.5 3D PBR Cinema Viewport Ready'}
                       </p>
                       <p className="text-xs text-neutral-500">
-                        Train the neural weights on the right, then synthesize 60 fps camera-tracked video with synced stereo audio.
+                        Train the local neural weights on the right, then synthesize 60 fps 3D volumetric scenes with synced stereo audio — zero API keys required.
                       </p>
                     </div>
                   )}
@@ -737,14 +742,14 @@ export const VisionVideoStudio: React.FC<VisionVideoStudioProps> = ({
 
               <section className="p-5 rounded-[22px] bg-white/95 dark:bg-[#1c1c1e]/95 border border-black/[0.06] dark:border-white/[0.08] shadow-[0_1px_2px_rgba(0,0,0,0.03),0_8px_24px_rgba(0,0,0,0.03)] space-y-3">
                 <h2 className="text-base font-semibold text-neutral-900 dark:text-white">
-                  Compositional Neural Cinema Architecture
+                  Cloned LTX-2.5 Dual-Stream 3D PBR Architecture
                 </h2>
                 <ul className="space-y-2 text-xs text-neutral-600 dark:text-neutral-400 leading-relaxed">
                   <li>
-                    <strong className="text-neutral-900 dark:text-neutral-200">1. {workerCount}-Worker Tri-Head AllReduce:</strong> Jointly trains visual pixels, a 14-latent compositional scene predictor, and an 8-channel neural audio head from scratch across all CPU workers.
+                    <strong className="text-neutral-900 dark:text-neutral-200">1. {workerCount}-Worker Tri-Head AllReduce + 8-Step Flow:</strong> Jointly trains visual pixels, a 14-latent scene predictor, and an 8-channel audio head from scratch, then denoises 8 spatiotemporal keyframes with rectified flow + bidirectional audio-video cross-attention.
                   </li>
                   <li>
-                    <strong className="text-neutral-900 dark:text-neutral-200">2. Sharp 320×180 2.5D Volumetric Cinema:</strong> Fuses the trained neural lighting field with multi-plane reflections, articulated dynamic subjects (cars, rockets, dragons, dogs, boats), perspective rain/embers, and camera trajectories.
+                    <strong className="text-neutral-900 dark:text-neutral-200">2. Real-Time 960×540 WebGL2 3D PBR Raymarching:</strong> Renders continuous volumetric clouds, Rayleigh/Mie atmospheric scattering, aurora curtains, 4-wave Gerstner ocean Fresnel reflections, 3D raymarched skylines, and ACES filmic grading with zero external API keys.
                   </li>
                   <li>
                     <strong className="text-neutral-900 dark:text-neutral-200">3. Synced Stereo Audio &amp; WebM Muxing:</strong> Synthesizes resonant surf, rain, turbine roar, chimes, and sub-bass synced to the 60 fps loop and exports muxed <span className="font-mono">.webm</span> files.

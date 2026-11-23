@@ -1,4 +1,5 @@
 import type { VideoSceneSpec } from '../engine/intentAndMedia';
+import type { LtxCinemaPayload } from '../engine/ltx25DiT';
 import type { CameraMotionMode } from '../engine/multimodal';
 import type { TokenCandidate } from '../engine/trainer';
 import type { NeuralAudioFrame } from '../utils/neuralAudioSynth';
@@ -15,6 +16,7 @@ export interface GeneratedVideoData {
   frames: Uint8ClampedArray[];
   audioTrack?: NeuralAudioFrame[];
   cameraMotion?: CameraMotionMode;
+  cinemaPayload?: LtxCinemaPayload;
 }
 
 export interface ChatMessage {

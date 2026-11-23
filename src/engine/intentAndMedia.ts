@@ -97,6 +97,9 @@ export function detectChatIntent(
       trimmed,
     );
 
+  const isExplanationQuestion =
+    /^(how|what|why|when|where|who|explain|describe|compare|difference)\b/i.test(trimmed);
+
   const asksVideo =
     /\b(generate|create|make|render|produce|show)\b.*\b(video|animation|animated clip|movie|timelapse|60\s*fps)\b/i.test(
       trimmed,
@@ -113,6 +116,18 @@ export function detectChatIntent(
 
   if (asksImage && !isCodeQuestion) {
     return 'image';
+  }
+
+  const asksFullStackBuild =
+    !isExplanationQuestion &&
+    (/\b(build|create|make|develop|architect|scaffold)\b.*\b(full[- ]?stack|web ?app|application|dashboard|portal|platform|saas|crm|kanban|ecommerce|storefront|tracker|crud|backend|express|database)\b/i.test(
+      trimmed,
+    ) ||
+      (/\b(build|create|make|develop)\b/i.test(trimmed) &&
+        /\b(api|database|sql|backend|server|auth)\b/i.test(trimmed)));
+
+  if (asksFullStackBuild) {
+    return 'build';
   }
 
   return 'text';

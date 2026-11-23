@@ -1,6 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, Pause, Play, Volume2, VolumeX } from 'lucide-react';
+import type { LtxCinemaPayload } from '../engine/ltx25DiT';
+import {
+  exportLtxCinemaToWebm,
+  LtxWebglRenderer,
+  renderLtxStillToDataUrl,
+} from '../engine/ltxCinemaWebgl';
 import type { CameraMotionMode } from '../engine/multimodal';
+import { isWebgl2Available } from '../engine/workerClient';
 import {
   createAudioBufferFromPcm,
   type NeuralAudioFrame,
@@ -21,6 +28,7 @@ interface CanvasMediaPlayerProps {
   label: string;
   audioTrack?: NeuralAudioFrame[];
   cameraMotion?: CameraMotionMode;
+  cinemaPayload?: LtxCinemaPayload;
   showScrubber?: boolean;
   displaySizeClass?: string;
 }
@@ -33,6 +41,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   label,
   audioTrack,
   cameraMotion,
+  cinemaPayload,
   showScrubber = false,
   displaySizeClass,
 }) => {
@@ -46,16 +55,26 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
     [frames],
   );
 
+  const [webglError, setWebglError] = useState<string | null>(null);
+  const useWebgl = Boolean(cinemaPayload && !webglError && isWebgl2Available());
+
   const isWide = width > height;
-  const resolvedCanvasW = isWide ? 512 : 288;
-  const resolvedCanvasH = isWide ? 288 : 288;
+  const resolvedCanvasW = useWebgl ? (isWide ? 960 : 640) : isWide ? 512 : 288;
+  const resolvedCanvasH = useWebgl ? (isWide ? 540 : 640) : isWide ? 288 : 288;
   const resolvedClass =
     displaySizeClass ??
     (isWide
-      ? 'w-full max-w-[460px] aspect-video'
-      : 'w-full max-w-[260px] sm:max-w-[288px] aspect-square');
+      ? 'w-full max-w-[640px] aspect-video'
+      : 'w-full max-w-[320px] sm:max-w-[360px] aspect-square');
 
-  const hasAudio = Array.isArray(audioTrack) && audioTrack.length > 0 && safeFrames.length > 1;
+  const isVideo = useWebgl ? fps > 1 : safeFrames.length > 1;
+  const totalFrames = useWebgl
+    ? isVideo
+      ? Math.max(2, Math.round((cinemaPayload?.durationSec || 4) * Math.max(1, fps)))
+      : 1
+    : safeFrames.length;
+
+  const hasAudio = Array.isArray(audioTrack) && audioTrack.length > 0 && isVideo;
   const [isPlaying, setIsPlaying] = useState(true);
   const [isMuted, setIsMuted] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
@@ -66,6 +85,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   );
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const webglRendererRef = useRef<LtxWebglRenderer | null>(null);
   const scratchCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const dCtxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -78,8 +98,6 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   const audioBufferRef = useRef<AudioBuffer | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const audioGainRef = useRef<GainNode | null>(null);
-
-  const isVideo = safeFrames.length > 1;
 
   const stopAudioPlayback = useCallback(() => {
     if (audioSourceRef.current) {
@@ -97,7 +115,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   useEffect(() => {
     audioBufferRef.current = null;
     stopAudioPlayback();
-  }, [audioTrack, safeFrames.length, fps, stopAudioPlayback]);
+  }, [audioTrack, totalFrames, fps, stopAudioPlayback]);
 
   useEffect(() => {
     return () => {
@@ -108,6 +126,33 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
       }
     };
   }, [stopAudioPlayback]);
+
+  // Initialize / dispose WebGL2 3D PBR raymarching renderer when cinemaPayload is active
+  useEffect(() => {
+    if (!useWebgl) {
+      webglRendererRef.current?.dispose();
+      webglRendererRef.current = null;
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    try {
+      const renderer = new LtxWebglRenderer(canvas);
+      webglRendererRef.current = renderer;
+      const tNorm = totalFrames > 1 ? (currentIdxRef.current % totalFrames) / totalFrames : 0.35;
+      if (cinemaPayload) {
+        renderer.render(cinemaPayload, tNorm, canvas.width, canvas.height);
+      }
+      return () => {
+        renderer.dispose();
+        if (webglRendererRef.current === renderer) {
+          webglRendererRef.current = null;
+        }
+      };
+    } catch (err) {
+      setWebglError(err instanceof Error ? err.message : 'WebGL2 shader initialization failed');
+    }
+  }, [useWebgl, cinemaPayload, resolvedCanvasW, resolvedCanvasH, totalFrames]);
 
   const startSyncedAudioAt = useCallback(
     async (frameIndex: number) => {
@@ -121,7 +166,9 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
         await ctx.resume().catch(() => {});
       }
       if (!audioBufferRef.current) {
-        const cycleSec = safeFrames.length / Math.max(1, fps);
+        const cycleSec = useWebgl
+          ? Math.max(1, cinemaPayload?.durationSec || 4)
+          : totalFrames / Math.max(1, fps);
         const pcm = renderNeuralAudioPcm(audioTrack, cycleSec, ctx.sampleRate);
         audioBufferRef.current = createAudioBufferFromPcm(ctx, pcm);
       }
@@ -138,7 +185,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
       src.start(0, offsetSec);
       audioSourceRef.current = src;
     },
-    [hasAudio, audioTrack, safeFrames.length, fps, stopAudioPlayback],
+    [hasAudio, audioTrack, useWebgl, cinemaPayload?.durationSec, totalFrames, fps, stopAudioPlayback],
   );
 
   // Sync Web Audio start/stop with playback, mute, viewport, and tab visibility
@@ -156,56 +203,63 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   const drawFrameAt = useCallback(
     (idx: number) => {
       const canvas = canvasRef.current;
-      if (!canvas || safeFrames.length === 0) return;
-      const safeIdx = Math.max(0, Math.min(safeFrames.length - 1, idx));
-      const frameBuf = safeFrames[safeIdx];
-      if (!frameBuf) return;
+      if (!canvas || totalFrames === 0) return;
+      const safeIdx = Math.max(0, Math.min(totalFrames - 1, idx));
       currentIdxRef.current = safeIdx;
 
-      if (!scratchCanvasRef.current) {
-        scratchCanvasRef.current = document.createElement('canvas');
-      }
-      const scratch = scratchCanvasRef.current;
-      if (scratch.width !== width || scratch.height !== height) {
-        scratch.width = width;
-        scratch.height = height;
-        sCtxRef.current = scratch.getContext('2d');
-        imgDataRef.current = null;
-      }
+      if (useWebgl && cinemaPayload && webglRendererRef.current) {
+        const tNorm = totalFrames > 1 ? safeIdx / totalFrames : 0.35;
+        webglRendererRef.current.render(cinemaPayload, tNorm, canvas.width, canvas.height);
+      } else {
+        if (safeFrames.length === 0) return;
+        const frameBuf = safeFrames[safeIdx];
+        if (!frameBuf) return;
 
-      if (!sCtxRef.current) {
-        sCtxRef.current = scratch.getContext('2d');
-      }
-      if (!dCtxRef.current) {
-        dCtxRef.current = canvas.getContext('2d');
-      }
-      const sCtx = sCtxRef.current;
-      const dCtx = dCtxRef.current;
-      if (!sCtx || !dCtx) return;
+        if (!scratchCanvasRef.current) {
+          scratchCanvasRef.current = document.createElement('canvas');
+        }
+        const scratch = scratchCanvasRef.current;
+        if (scratch.width !== width || scratch.height !== height) {
+          scratch.width = width;
+          scratch.height = height;
+          sCtxRef.current = scratch.getContext('2d');
+          imgDataRef.current = null;
+        }
 
-      if (
-        !imgDataRef.current ||
-        imgDataRef.current.width !== width ||
-        imgDataRef.current.height !== height
-      ) {
-        imgDataRef.current = sCtx.createImageData(width, height);
-      }
-      const imgData = imgDataRef.current;
-      imgData.data.set(frameBuf);
-      sCtx.putImageData(imgData, 0, 0);
+        if (!sCtxRef.current) {
+          sCtxRef.current = scratch.getContext('2d');
+        }
+        if (!dCtxRef.current) {
+          dCtxRef.current = canvas.getContext('2d');
+        }
+        const sCtx = sCtxRef.current;
+        const dCtx = dCtxRef.current;
+        if (!sCtx || !dCtx) return;
 
-      dCtx.imageSmoothingEnabled = true;
-      dCtx.imageSmoothingQuality = 'high';
-      dCtx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
+        if (
+          !imgDataRef.current ||
+          imgDataRef.current.width !== width ||
+          imgDataRef.current.height !== height
+        ) {
+          imgDataRef.current = sCtx.createImageData(width, height);
+        }
+        const imgData = imgDataRef.current;
+        imgData.data.set(frameBuf);
+        sCtx.putImageData(imgData, 0, 0);
+
+        dCtx.imageSmoothingEnabled = true;
+        dCtx.imageSmoothingQuality = 'high';
+        dCtx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
+      }
 
       if (frameLabelRef.current) {
-        frameLabelRef.current.textContent = `Frame ${safeIdx + 1}/${safeFrames.length} · ${fps} fps`;
+        frameLabelRef.current.textContent = `Frame ${safeIdx + 1}/${totalFrames} · ${fps} fps`;
       }
       if (scrubberRef.current && document.activeElement !== scrubberRef.current) {
         scrubberRef.current.value = String(safeIdx);
       }
     },
-    [safeFrames, width, height, fps],
+    [useWebgl, cinemaPayload, totalFrames, safeFrames, width, height, fps],
   );
 
   useEffect(() => {
@@ -220,7 +274,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
     );
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, []);
+  }, [useWebgl]);
 
   useEffect(() => {
     const onVisibility = () => setIsTabVisible(!document.hidden);
@@ -229,15 +283,15 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   }, []);
 
   useEffect(() => {
-    if (safeFrames.length === 0) return;
-    drawFrameAt(currentIdxRef.current % safeFrames.length);
+    if (totalFrames === 0) return;
+    drawFrameAt(currentIdxRef.current % totalFrames);
     if (!isVideo || !isPlaying || !isInViewport || !isTabVisible) return;
 
     let rafId = 0;
     const start = performance.now() - (currentIdxRef.current / Math.max(1, fps)) * 1000;
     const tick = (now: number) => {
       const elapsedSec = (now - start) / 1000;
-      const nextIdx = Math.floor(elapsedSec * fps) % safeFrames.length;
+      const nextIdx = Math.floor(elapsedSec * fps) % totalFrames;
       if (nextIdx !== currentIdxRef.current) {
         drawFrameAt(nextIdx);
       }
@@ -245,9 +299,19 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [safeFrames, fps, isVideo, isPlaying, isInViewport, isTabVisible, drawFrameAt]);
+  }, [totalFrames, fps, isVideo, isPlaying, isInViewport, isTabVisible, drawFrameAt]);
 
   const handleDownloadPng = () => {
+    if (useWebgl && cinemaPayload) {
+      const tNorm = totalFrames > 1 ? currentIdxRef.current / totalFrames : 0.35;
+      const url =
+        renderLtxStillToDataUrl(cinemaPayload, tNorm, resolvedCanvasW, resolvedCanvasH) ??
+        canvasRef.current?.toDataURL('image/png');
+      if (url) {
+        triggerDataUrlDownload(url, 'qowe-ltx25-frame.png');
+      }
+      return;
+    }
     if (safeFrames.length === 0) return;
     const frameBuf = safeFrames[currentIdxRef.current];
     if (!frameBuf) return;
@@ -256,22 +320,33 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
   };
 
   const handleDownloadWebm = async () => {
-    if (!isVideo || isExporting || safeFrames.length === 0) return;
+    if (!isVideo || isExporting) return;
+    if (!useWebgl && safeFrames.length === 0) return;
     setExportError(null);
     setIsExporting(true);
     try {
-      const outW = isWide ? 512 : 384;
-      const outH = isWide ? 288 : 384;
-      const blob = await recordRgbaFramesToWebm(
-        safeFrames,
-        width,
-        height,
-        outW,
-        fps,
-        outH,
-        audioTrack,
-      );
-      triggerBlobDownload(blob, 'qowe-1.0-60fps-audio-video.webm');
+      if (useWebgl && cinemaPayload) {
+        const blob = await exportLtxCinemaToWebm(
+          cinemaPayload,
+          audioTrack,
+          resolvedCanvasW,
+          resolvedCanvasH,
+        );
+        triggerBlobDownload(blob, 'qowe-ltx25-cinema.webm');
+      } else {
+        const outW = isWide ? 512 : 384;
+        const outH = isWide ? 288 : 384;
+        const blob = await recordRgbaFramesToWebm(
+          safeFrames,
+          width,
+          height,
+          outW,
+          fps,
+          outH,
+          audioTrack,
+        );
+        triggerBlobDownload(blob, 'qowe-1.0-60fps-audio-video.webm');
+      }
     } catch (err) {
       setExportError(err instanceof Error ? err.message : 'Unable to encode WebM video.');
     } finally {
@@ -284,10 +359,12 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
     setIsMuted((prev) => !prev);
   };
 
-  if (safeFrames.length === 0) {
+  if (!useWebgl && safeFrames.length === 0) {
     return (
       <div className="p-3.5 rounded-2xl border border-black/[0.08] dark:border-white/[0.1] bg-[#f5f5f7] dark:bg-[#121214] text-xs text-neutral-500 dark:text-neutral-400">
-        Video buffer unavailable. Re-run the prompt to synthesize fresh 60 fps frames.
+        {webglError
+          ? `Renderer notice: ${webglError}. Re-run the prompt to synthesize frames.`
+          : 'Video buffer unavailable. Re-run the prompt to synthesize fresh 60 fps frames.'}
       </div>
     );
   }
@@ -296,6 +373,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
     <div className="w-full space-y-2.5 flex flex-col items-start">
       <div className="rounded-2xl overflow-hidden border border-black/[0.08] dark:border-white/[0.1] bg-neutral-950 max-w-full">
         <canvas
+          key={useWebgl ? 'webgl2' : 'canvas2d'}
           ref={canvasRef}
           width={resolvedCanvasW}
           height={resolvedCanvasH}
@@ -304,9 +382,15 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
         />
       </div>
 
-      {isVideo && (cameraMotion || hasAudio) && (
+      {(isVideo || useWebgl) && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
-          {cameraMotion && (
+          {useWebgl && cinemaPayload && (
+            <span className="font-mono">
+              LTX-2.5 Dual-Stream · {resolvedCanvasW}×{resolvedCanvasH} · Flow{' '}
+              {(cinemaPayload.flowConsistencyScore * 100).toFixed(1)}%
+            </span>
+          )}
+          {isVideo && cameraMotion && (
             <span className="font-mono">Camera: {cameraMotion}</span>
           )}
           {hasAudio && (
@@ -323,7 +407,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
             ref={scrubberRef}
             type="range"
             min={0}
-            max={Math.max(0, safeFrames.length - 1)}
+            max={Math.max(0, totalFrames - 1)}
             defaultValue={0}
             aria-label="Scrub video frames"
             onChange={(e) => {
@@ -366,7 +450,7 @@ export const CanvasMediaPlayer: React.FC<CanvasMediaPlayerProps> = React.memo(({
               ref={frameLabelRef}
               className="font-mono text-neutral-500 dark:text-neutral-400 tabular-nums"
             >
-              Frame 1/{safeFrames.length} · {fps} fps
+              Frame 1/{totalFrames} · {fps} fps
             </span>
           </>
         )}

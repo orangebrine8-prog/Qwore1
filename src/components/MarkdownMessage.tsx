@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { Check, CheckSquare, Code2, Copy, Download, Play, Square } from 'lucide-react';
+import { parseFullStackFiles } from '../engine/fullStackProject';
 import { triggerDataUrlDownload } from '../utils/mediaExport';
+import { FullStackProjectCard } from './FullStackProjectCard';
 
 interface MarkdownMessageProps {
   content: string;
@@ -65,8 +67,8 @@ const CodeBlock = React.memo(function CodeBlock({
   code: string;
   isStreaming?: boolean;
 }) {
-  const langLower = language.trim().toLowerCase();
-  const isRunnable = langLower === 'html' || langLower === 'svg';
+  const baseLang = (language.trim().split(/[\s:]/)[0] || '').toLowerCase();
+  const isRunnable = baseLang === 'html' || baseLang === 'svg';
   const [manualViewMode, setManualViewMode] = useState<'preview' | 'code' | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -85,11 +87,11 @@ const CodeBlock = React.memo(function CodeBlock({
   };
 
   const handleDownloadArtifact = () => {
-    const ext = langLower === 'svg' ? 'svg' : langLower === 'html' ? 'html' : langLower || 'txt';
+    const ext = baseLang === 'svg' ? 'svg' : baseLang === 'html' ? 'html' : baseLang || 'txt';
     const mime =
-      langLower === 'svg'
+      baseLang === 'svg'
         ? 'image/svg+xml;charset=utf-8'
-        : langLower === 'html'
+        : baseLang === 'html'
           ? 'text/html;charset=utf-8'
           : 'text/plain;charset=utf-8';
     const dataUrl = `data:${mime},${encodeURIComponent(code)}`;
@@ -140,11 +142,11 @@ const CodeBlock = React.memo(function CodeBlock({
             <button
               type="button"
               onClick={handleDownloadArtifact}
-              aria-label={`Download .${langLower === 'svg' ? 'svg' : 'html'} artifact`}
+              aria-label={`Download .${baseLang === 'svg' ? 'svg' : 'html'} artifact`}
               className="inline-flex items-center gap-1 text-xs text-neutral-300 hover:text-white transition-colors whitespace-nowrap shrink-0"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>.{langLower === 'svg' ? 'svg' : 'html'}</span>
+              <span>.{baseLang === 'svg' ? 'svg' : 'html'}</span>
             </button>
           )}
           <button
@@ -162,9 +164,9 @@ const CodeBlock = React.memo(function CodeBlock({
       {isRunnable && viewMode === 'preview' && !isStreaming ? (
         <div className="bg-white dark:bg-[#121214]">
           <iframe
-            title={`Qowe 1.0 live ${langLower} build preview`}
+            title={`Qowe 1.0 live ${baseLang} build preview`}
             sandbox="allow-scripts"
-            srcDoc={buildSandboxSrcDoc(langLower, code)}
+            srcDoc={buildSandboxSrcDoc(baseLang, code)}
             className="w-full h-[300px] sm:h-[400px] border-0 block bg-white"
           />
         </div>
@@ -178,32 +180,52 @@ const CodeBlock = React.memo(function CodeBlock({
 });
 
 export const MarkdownMessage: React.FC<MarkdownMessageProps> = React.memo(({ content, isStreaming = false }) => {
+  const fullStackProject = useMemo(
+    () => (isStreaming ? null : parseFullStackFiles(content)),
+    [content, isStreaming],
+  );
+
   const segments = useMemo(() => {
-    const out: { type: 'text' | 'code'; language?: string; body: string }[] = [];
-    const fenceRegex = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g;
+    const out: { type: 'text' | 'code' | 'fullstack'; language?: string; body: string }[] = [];
+    const fenceRegex = /```([^\n]*)\n([\s\S]*?)```/g;
     let lastIdx = 0;
+    let insertedFullStackCard = false;
     let match: RegExpExecArray | null;
+
+    const strippedSet = fullStackProject?.strippedRanges ?? [];
+    const isStrippedRange = (start: number, end: number) =>
+      strippedSet.some((r) => r.start === start && r.end === end);
 
     while ((match = fenceRegex.exec(content)) !== null) {
       if (match.index > lastIdx) {
         out.push({ type: 'text', body: content.slice(lastIdx, match.index) });
       }
-      out.push({
-        type: 'code',
-        language: match[1],
-        body: match[2].replace(/\n$/, ''),
-      });
+      if (fullStackProject && isStrippedRange(match.index, fenceRegex.lastIndex)) {
+        if (!insertedFullStackCard) {
+          out.push({ type: 'fullstack', body: '' });
+          insertedFullStackCard = true;
+        }
+      } else {
+        out.push({
+          type: 'code',
+          language: match[1],
+          body: match[2].replace(/\n$/, ''),
+        });
+      }
       lastIdx = fenceRegex.lastIndex;
     }
     if (lastIdx < content.length) {
       out.push({ type: 'text', body: content.slice(lastIdx) });
     }
     return out;
-  }, [content]);
+  }, [content, fullStackProject]);
 
   return (
     <div className="space-y-2.5 text-[15px] leading-relaxed text-slate-800 dark:text-slate-200">
       {segments.map((seg, idx) => {
+        if (seg.type === 'fullstack' && fullStackProject) {
+          return <FullStackProjectCard key={`fs-${fullStackProject.id}-${idx}`} project={fullStackProject} />;
+        }
         if (seg.type === 'code') {
           return (
             <CodeBlock

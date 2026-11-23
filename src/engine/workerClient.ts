@@ -1,6 +1,7 @@
 import type { WorkerCommand, WorkerEvent } from './qowe.worker';
 import {
   CameraMotionMode,
+  type LtxCinemaPayload,
   MultimodalCheckpoint,
   MultimodalHyperparams,
   MultimodalStepMetric,
@@ -8,6 +9,23 @@ import {
   resolveCameraMotion,
 } from './multimodal';
 import type { NeuralAudioFrame } from '../utils/neuralAudioSynth';
+
+let cachedWebgl2Available: boolean | null = null;
+export function isWebgl2Available(): boolean {
+  if (cachedWebgl2Available !== null) return cachedWebgl2Available;
+  if (typeof document === 'undefined') {
+    cachedWebgl2Available = false;
+    return false;
+  }
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl2');
+    cachedWebgl2Available = Boolean(gl);
+  } catch {
+    cachedWebgl2Available = false;
+  }
+  return cachedWebgl2Available;
+}
 
 let sharedWorker: Worker | null = null;
 const listeners = new Set<(event: WorkerEvent) => void>();
@@ -264,6 +282,7 @@ export interface GenerateMediaPoolOptions {
   cameraMotion?: CameraMotionMode;
   withAudio?: boolean;
   numFrames?: number;
+  durationSec?: number;
 }
 
 export async function generateMediaInPool(
@@ -279,6 +298,7 @@ export async function generateMediaInPool(
   frames: Uint8ClampedArray[];
   audioTrack?: NeuralAudioFrame[];
   cameraMotion?: Exclude<CameraMotionMode, 'auto'>;
+  cinemaPayload?: LtxCinemaPayload;
   checkpoint: MultimodalCheckpoint;
 }> {
   let activeCheckpoint = checkpoint;
@@ -305,9 +325,36 @@ export async function generateMediaInPool(
 
   const pool = getWorkerPool();
   const engine = QoweVisionVideoEngine.fromCheckpoint(activeCheckpoint);
-  const weights = engine.getWeightArrays();
   const aspectRatio = options.aspectRatio ?? '16:9';
+  const fps = 60;
+  const durationSec = options.durationSec ?? 4;
+  const resolvedCam = resolveCameraMotion(prompt, options.cameraMotion ?? 'auto');
+  const { payload: cinemaPayload, audioTrack: fullAudio } = engine.predictCinemaPayload(prompt, {
+    aspectRatio,
+    durationSec,
+    fps,
+    cameraMotion: resolvedCam,
+    keyframeCount: 8,
+    denoisingSteps: 8,
+  });
 
+  // On GPU-capable browsers, stream LTX-2.5 latents directly into WebGL2 3D PBR raymarcher at 960x540 / 640x640
+  if (isWebgl2Available()) {
+    const outW = aspectRatio === '16:9' ? 960 : 640;
+    const outH = aspectRatio === '16:9' ? 540 : 640;
+    return {
+      width: outW,
+      height: outH,
+      fps: kind === 'image' ? 1 : fps,
+      frames: [],
+      audioTrack: kind === 'video' && options.withAudio !== false ? fullAudio : undefined,
+      cameraMotion: resolvedCam,
+      cinemaPayload,
+      checkpoint: activeCheckpoint,
+    };
+  }
+
+  const weights = engine.getWeightArrays();
   if (kind === 'image') {
     const width = aspectRatio === '16:9' ? 384 : 256;
     const height = aspectRatio === '16:9' ? 216 : 256;
@@ -332,16 +379,15 @@ export async function generateMediaInPool(
       height,
       fps: 1,
       frames: res.frames,
+      cinemaPayload,
       checkpoint: activeCheckpoint,
     };
   }
 
-  // Parallel 60 fps Veo-style audio-video synthesis across all browser worker threads
+  // CPU fallback slice rendering across all browser worker threads
   const numFrames = options.numFrames ?? 120;
   const width = aspectRatio === '16:9' ? 320 : 240;
   const height = aspectRatio === '16:9' ? 180 : 240;
-  const fps = 60;
-  const resolvedCam = resolveCameraMotion(prompt, options.cameraMotion ?? 'auto');
   const times = Array.from({ length: numFrames }, (_, idx) => idx / numFrames);
   const chunkSize = Math.ceil(numFrames / pool.length);
 
@@ -381,6 +427,7 @@ export async function generateMediaInPool(
     frames,
     audioTrack,
     cameraMotion: resolvedCam,
+    cinemaPayload,
     checkpoint: activeCheckpoint,
   };
 }

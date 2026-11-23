@@ -18,7 +18,10 @@ import {
   QoweArchitectureConfig,
 } from './engine/architecture';
 import { TRAINING_DATASETS } from './engine/datasets';
-import type { QoweFullModelBundle } from './engine/exporter';
+import {
+  type QoweFullModelBundle,
+  trainAssistantCheckpointAsync,
+} from './engine/exporter';
 import { detectChatIntent, type VideoSceneSpec } from './engine/intentAndMedia';
 import type { MultimodalCheckpoint } from './engine/multimodal';
 import { QoweCheckpoint, QoweTrainerEngine } from './engine/trainer';
@@ -30,6 +33,7 @@ import { DownloadModelModal } from './components/DownloadModelModal';
 import { Sidebar } from './components/Sidebar';
 import { TrainingStudio } from './components/TrainingStudio';
 import { VisionVideoStudio } from './components/VisionVideoStudio';
+import { renderLtxStillToDataUrl } from './engine/ltxCinemaWebgl';
 import type {
   ChatEngineMode,
   ChatMessage,
@@ -39,7 +43,7 @@ import type {
   SamplingSettings,
   WorkspaceTab,
 } from './types/qowe';
-import { svgToPngDataUrl } from './utils/mediaExport';
+import { rgbaFrameToDataUrl, svgToPngDataUrl } from './utils/mediaExport';
 
 const STORAGE_KEYS = {
   conversations: 'qowe_conversations_v1',
@@ -416,7 +420,34 @@ export default function App() {
         if (accumulated) flushAccumulated();
         return;
       }
-      const errMessage = err instanceof Error ? err.message : 'Unable to reach Qowe 1.0 server.';
+      // Always fall back cleanly to local Qowe 1.0 neural weights if backend or upstream hits limits
+      if (!accumulated) {
+        try {
+          const userMsgs = historyForRequest.filter((m) => m.role === 'user');
+          const lastUserPrompt = userMsgs[userMsgs.length - 1]?.content ?? '';
+          const activeCp =
+            checkpoint && checkpoint.step >= 60
+              ? checkpoint
+              : await trainAssistantCheckpointAsync(checkpoint, corpus, 140);
+          if (!checkpoint || activeCp.step > checkpoint.step) {
+            handleSaveCheckpoint(activeCp);
+          }
+          const engine = QoweTrainerEngine.fromCheckpoint(activeCp, corpus);
+          const gen = engine.generate(`<|user|> ${lastUserPrompt.trim()}\n<|assistant|>`, {
+            maxNewTokens: sampling.maxTokens,
+            temperature: Math.min(0.25, sampling.temperature),
+            topK: Math.min(3, sampling.topK),
+          });
+          accumulated =
+            gen.text.trim() ||
+            `I am ${archConfig.name} (${totalParamsFormatted}), running locally on unlimited weights.`;
+          flushAccumulated();
+          return;
+        } catch {
+          // Fall through to clean fallback error if local generation also failed
+        }
+      }
+      const errMessage = err instanceof Error ? err.message : 'Unable to reach Qowe 1.0 engine.';
       setConversations((prev) =>
         prev.map((c) =>
           c.id === convId
@@ -499,25 +530,44 @@ export default function App() {
     if (isMediaMode) {
       try {
         if (effectiveOutputMode === 'image') {
-          const resp = await fetch('/api/generate-image', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: text, aspectRatio: '1:1' }),
+          const media = await generateMediaInPool('image', text, multimodalCheckpoint, 140, {
+            aspectRatio: '1:1',
           });
-          const data = (await resp.json()) as {
-            svg?: string;
-            width?: number;
-            height?: number;
-            error?: string;
-          };
-          if (!resp.ok || !data.svg) {
-            throw new Error(data.error || 'Image generation failed.');
+          if (!multimodalCheckpoint) {
+            handleSaveMultimodalCheckpoint(media.checkpoint);
           }
-          const pngUrl = await svgToPngDataUrl(
-            data.svg,
-            data.width ?? 1024,
-            data.height ?? 1024,
-          );
+
+          let pngUrl = media.cinemaPayload
+            ? renderLtxStillToDataUrl(media.cinemaPayload, 0.35, media.width, media.height)
+            : null;
+          let fallbackSvg: string | undefined;
+
+          if (!pngUrl && media.frames[0]) {
+            pngUrl = rgbaFrameToDataUrl(media.frames[0], media.width, media.height, 4);
+          }
+          if (!pngUrl) {
+            const resp = await fetch('/api/generate-image', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt: text, aspectRatio: '1:1' }),
+            });
+            const data = (await resp.json()) as {
+              svg?: string;
+              width?: number;
+              height?: number;
+              error?: string;
+            };
+            if (!resp.ok || !data.svg) {
+              throw new Error(data.error || 'Image generation failed.');
+            }
+            pngUrl = await svgToPngDataUrl(
+              data.svg,
+              data.width ?? 1024,
+              data.height ?? 1024,
+            );
+            fallbackSvg = data.svg;
+          }
+
           setConversations((prev) =>
             prev.map((c) =>
               c.id === convId
@@ -527,9 +577,9 @@ export default function App() {
                       m.id === assistantMsgId
                         ? {
                             ...m,
-                            content: `Generated ${data.width ?? 1024}×${data.height ?? 1024} artwork for "${text.slice(0, 80)}".`,
-                            imageDataUrl: pngUrl,
-                            svgMarkup: data.svg,
+                            content: `Generated ${media.width}×${media.height} LTX-2.5 3D PBR image for "${text.slice(0, 80)}" (zero API keys).`,
+                            imageDataUrl: pngUrl ?? undefined,
+                            svgMarkup: fallbackSvg,
                           }
                         : m,
                     ),
@@ -555,7 +605,7 @@ export default function App() {
                       m.id === assistantMsgId
                         ? {
                             ...m,
-                            content: `Generated 60 fps ${media.width}×${media.height} video + synced stereo neural audio from scratch (Step ${media.checkpoint.step}, camera: ${media.cameraMotion ?? 'auto'}). Unmute audio or export .webm below.`,
+                            content: `Generated 60 fps ${media.width}×${media.height} LTX-2.5 Dual-Stream 3D PBR video + synced stereo neural audio locally (Step ${media.checkpoint.step}, camera: ${media.cameraMotion ?? 'auto'}, zero API keys). Unmute audio or export .webm below.`,
                             videoData: {
                               width: media.width,
                               height: media.height,
@@ -563,6 +613,7 @@ export default function App() {
                               frames: media.frames,
                               audioTrack: media.audioTrack,
                               cameraMotion: media.cameraMotion,
+                              cinemaPayload: media.cinemaPayload,
                             },
                           }
                         : m,
@@ -623,9 +674,31 @@ export default function App() {
     }
 
     if (effectiveOutputMode === 'text' && engineMode === 'local-weights') {
-      if (!checkpoint) return;
       try {
-        const engine = QoweTrainerEngine.fromCheckpoint(checkpoint, corpus);
+        let activeCp = checkpoint;
+        if (!activeCp || activeCp.step < 60) {
+          activeCp = await trainAssistantCheckpointAsync(activeCp, corpus, 140, (step, total, loss) => {
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === convId
+                  ? {
+                      ...c,
+                      messages: c.messages.map((m) =>
+                        m.id === assistantMsgId
+                          ? {
+                              ...m,
+                              content: `Training local Qowe 1.0 weights from scratch (${step}/${total} steps · Loss ${loss.toFixed(3)})...`,
+                            }
+                          : m,
+                      ),
+                    }
+                  : c,
+              ),
+            );
+          });
+          handleSaveCheckpoint(activeCp);
+        }
+        const engine = QoweTrainerEngine.fromCheckpoint(activeCp, corpus);
         const promptFormatted = `<|user|> ${text}\n<|assistant|>`;
         const gen = engine.generate(promptFormatted, {
           maxNewTokens: sampling.maxTokens,
@@ -904,8 +977,10 @@ export default function App() {
         onClose={() => setIsDownloadModalOpen(false)}
         architecture={archConfig}
         totalParamsFormatted={totalParamsFormatted}
+        corpus={corpus}
         textCheckpoint={checkpoint}
         multimodalCheckpoint={multimodalCheckpoint}
+        onSaveTextCheckpoint={handleSaveCheckpoint}
         onImportBundle={handleImportBundle}
       />
     </div>

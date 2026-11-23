@@ -2,7 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateArchitectureSpecs, QOWE_PRESETS } from './architecture';
 import { TRAINING_DATASETS } from './datasets';
-import { buildPytorchScript } from './exporter';
+import {
+  buildFullModelBundle,
+  buildPytorchScript,
+  buildStandaloneChatHtml,
+  ensureTrainedTextCheckpoint,
+  isTextCheckpointReadyForChat,
+} from './exporter';
 import { QoweVisionVideoEngine } from './multimodal';
 import { decode, encode, trainTokenizer } from './tokenizer';
 import { QoweTrainerEngine } from './trainer';
@@ -179,17 +185,89 @@ test('Multi-worker AllReduce training reduces visual+audio loss and renders 16:9
     energy += Math.abs(pcm.left[i]);
   }
   assert.ok(energy > 1, 'Expected audible neural waveform synthesis');
+
+  const ltxResult = coordinator.predictCinemaPayload(
+    'stormy ocean waves crashing against jagged volcanic cliffs under emerald aurora',
+    { aspectRatio: '16:9', durationSec: 4, fps: 60, keyframeCount: 8, denoisingSteps: 8 },
+  );
+  assert.equal(ltxResult.payload.aspectRatio, '16:9');
+  assert.equal(ltxResult.payload.denoisingSteps, 8);
+  assert.equal(ltxResult.payload.neuralKeyframes.length, 8);
+  assert.equal(ltxResult.payload.sceneLatents.length, 14);
+  assert.ok(
+    ltxResult.payload.flowConsistencyScore > 0.5 && ltxResult.payload.flowConsistencyScore <= 1,
+    `Expected flowConsistencyScore in (0.5, 1], got ${ltxResult.payload.flowConsistencyScore}`,
+  );
+  assert.equal(ltxResult.audioTrack.length, 240);
 });
 
-test('Standalone PyTorch exporter reflects exact 800B and Base architecture configs', () => {
+test('Standalone PyTorch exporter reflects exact 800B, Base, and cloned LTX-2.5 Dual-Stream DiT configs', () => {
   const scriptUltra = buildPytorchScript(QOWE_PRESETS[0]);
   assert.ok(scriptUltra.includes('801.32B'));
   assert.ok(scriptUltra.includes('d_model: int = 20480'));
   assert.ok(scriptUltra.includes('n_layers: int = 158'));
   assert.ok(scriptUltra.includes('class Qowe1Model'));
+  assert.ok(scriptUltra.includes('class QoweLTX25DualStreamDiT'));
+  assert.ok(scriptUltra.includes('class AsymmetricDualStreamDiTBlock'));
+  assert.ok(scriptUltra.includes('class RectifiedFlowScheduler'));
 
   const scriptBase = buildPytorchScript(QOWE_PRESETS[1]);
   assert.ok(scriptBase.includes('124,439,808'));
   assert.ok(scriptBase.includes('d_model: int = 768'));
   assert.ok(scriptBase.includes('n_layers: int = 12'));
+});
+
+test('Exported JSON bundle auto-trains assistant weights and referenceInferenceJs generates coherent assistant replies', () => {
+  const trainedCp = ensureTrainedTextCheckpoint(null, TRAINING_DATASETS[0].corpus, 140);
+  assert.equal(isTextCheckpointReadyForChat(trainedCp), true);
+  assert.ok(trainedCp.loss < 1.1, `Expected converged assistant loss < 1.1, got ${trainedCp.loss}`);
+
+  const rawBundle = buildFullModelBundle(QOWE_PRESETS[1], trainedCp, null);
+  const roundTripped = JSON.parse(JSON.stringify(rawBundle)) as typeof rawBundle;
+
+  assert.equal(roundTripped.format, 'qowe-1.0-bundle');
+  assert.equal(roundTripped.inferenceSpec.readyForChat, true);
+  assert.deepEqual(roundTripped.inferenceSpec.stopTokenIds, [1, 2]);
+  assert.ok(roundTripped.inferenceSpec.tensorLayouts.lmHead.includes('[vocabSize, dModel]'));
+
+  const qoweGenerate = new Function(
+    `${roundTripped.inferenceSpec.referenceInferenceJs}\nreturn qoweGenerate;`,
+  )() as (
+    bundle: typeof roundTripped,
+    prompt: string,
+    opts?: { temperature?: number; topK?: number; maxNewTokens?: number; greedy?: boolean },
+  ) => { text: string; generatedTokens: number };
+
+  const replyIdentity = qoweGenerate(roundTripped, 'Who are you?', {
+    temperature: 0.2,
+    topK: 1,
+    maxNewTokens: 32,
+    greedy: true,
+  });
+  assert.ok(replyIdentity.generatedTokens > 3);
+  assert.ok(
+    replyIdentity.text.includes('Qowe') || replyIdentity.text.includes('transformer'),
+    `Expected coherent assistant identity reply, got: ${JSON.stringify(replyIdentity.text)}`,
+  );
+
+  const replyGreeting = qoweGenerate(roundTripped, 'Hi', {
+    temperature: 0.2,
+    topK: 1,
+    maxNewTokens: 32,
+    greedy: true,
+  });
+  assert.ok(replyGreeting.generatedTokens > 3);
+  assert.ok(
+    replyGreeting.text.includes('Qowe') ||
+      replyGreeting.text.includes('Hello') ||
+      replyGreeting.text.includes('assistant'),
+    `Expected coherent assistant greeting reply, got: ${JSON.stringify(replyGreeting.text)}`,
+  );
+
+  const html = buildStandaloneChatHtml(roundTripped);
+  assert.ok(html.includes('<!DOCTYPE html>'));
+  assert.ok(html.includes('function qoweGenerate'));
+  assert.ok(html.includes('Qowe 1.0 Standalone Local Assistant'));
+  // Embedded JSON must escape '<' so '</script' cannot break HTML parsing
+  assert.equal(html.match(/<\/script>/gi)?.length, 1);
 });

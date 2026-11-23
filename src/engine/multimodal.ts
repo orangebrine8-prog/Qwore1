@@ -6,8 +6,9 @@ import {
   parseCinemaPrompt,
   SCENE_LATENT_DIM,
 } from './cinemaCompositor';
+import { type LtxCinemaPayload, runLtx25DualStreamFlow } from './ltx25DiT';
 
-export type { CameraMotionMode };
+export type { CameraMotionMode, LtxCinemaPayload };
 
 export interface MultimodalHyperparams {
   dCond: number;
@@ -1518,6 +1519,67 @@ export class QoweVisionVideoEngine {
     const frames = this.renderFramesBatch(prompt, size, size, times, cam);
     const audioTrack = this.predictAudioTrack(prompt, times, cam);
     return { width: size, height: size, fps, frames, audioTrack, cameraMotion: cam };
+  }
+
+  public predictCinemaPayload(
+    prompt: string,
+    options: {
+      aspectRatio?: '16:9' | '1:1';
+      durationSec?: number;
+      fps?: number;
+      cameraMotion?: CameraMotionMode;
+      keyframeCount?: number;
+      denoisingSteps?: number;
+    } = {},
+  ): { payload: LtxCinemaPayload; audioTrack: NeuralAudioFrame[] } {
+    const aspectRatio = options.aspectRatio ?? '16:9';
+    const durationSec = Math.max(2, Math.min(8, options.durationSec ?? 4));
+    const fps = options.fps ?? 60;
+    const keyframeCount = Math.max(4, options.keyframeCount ?? 8);
+    const keyframeW = aspectRatio === '16:9' ? 48 : 36;
+    const keyframeH = aspectRatio === '16:9' ? 27 : 36;
+    const denoisingSteps = options.denoisingSteps ?? 8;
+
+    const { cond } = this.poolPrompt(prompt);
+    const cam = resolveCameraMotion(prompt, options.cameraMotion ?? 'auto');
+    const latents = this.predictSceneLatents(prompt);
+
+    const kfTimes = Array.from({ length: keyframeCount }, (_, i) => i / Math.max(1, keyframeCount - 1));
+    const baseKeyframes = this.evalNeuralFieldGrid(cond, keyframeW, keyframeH, kfTimes);
+
+    const totalAudioSlices = Math.min(240, Math.round(durationSec * fps));
+    const audioTimes = Array.from({ length: totalAudioSlices }, (_, i) => i / totalAudioSlices);
+    const audioTrack = this.predictAudioTrack(prompt, audioTimes, cam);
+
+    const { denoisedKeyframes, flowConsistencyScore } = runLtx25DualStreamFlow({
+      baseKeyframes,
+      keyframeW,
+      keyframeH,
+      sceneLatents: latents,
+      audioTrack,
+      config: { denoisingSteps },
+    });
+
+    const neuralBlendWeight = Math.min(0.68, 0.25 + Math.min(1, this.step / 100) * 0.43);
+
+    return {
+      payload: {
+        prompt,
+        aspectRatio,
+        durationSec,
+        fps,
+        cameraMotion: cam,
+        sceneLatents: Array.from(latents),
+        neuralKeyframes: denoisedKeyframes,
+        keyframeW,
+        keyframeH,
+        neuralBlendWeight,
+        trainingStep: this.step,
+        denoisingSteps,
+        flowConsistencyScore,
+      },
+      audioTrack,
+    };
   }
 
   public generateCinematicVideo(

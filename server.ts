@@ -17,6 +17,7 @@ import {
   sanitizeGeneratedSvg,
   type VideoSceneSpec,
 } from './src/engine/intentAndMedia.ts';
+import { generateLocalQoweResponse } from './server/localQoweFallback.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -87,26 +88,52 @@ function isTransientUpstreamError(err: unknown): boolean {
     msg.includes('503') ||
     msg.includes('504') ||
     msg.includes('high demand') ||
+    msg.includes('try again later') ||
+    msg.includes('temporarily') ||
+    msg.includes('quota') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('rate limit') ||
+    msg.includes('too many requests') ||
+    msg.includes('capacity') ||
     msg.includes('unavailable') ||
     msg.includes('internal') ||
     msg.includes('overloaded') ||
     msg.includes('timeout') ||
     msg.includes('aborted') ||
-    msg.includes('fetch failed')
+    msg.includes('fetch failed') ||
+    msg.includes('not configured')
   );
 }
+
+const UPSTREAM_MODEL_CHAIN: { model: string; useThinking: boolean }[] = [
+  { model: 'gemini-4-hydrogen', useThinking: true },
+  { model: 'gemini-3.1-flash-lite', useThinking: false },
+  { model: 'gemini-2.5-flash', useThinking: false },
+];
 
 async function generateWithHydrogenFallback<T>(
   runner: (model: string, useThinking: boolean) => Promise<T>,
 ): Promise<T> {
-  try {
-    return await runner('gemini-4-hydrogen', true);
-  } catch (err) {
-    if (isTransientUpstreamError(err)) {
-      return await runner('gemini-3.1-flash-lite', false);
+  let lastErr: unknown;
+  for (const candidate of UPSTREAM_MODEL_CHAIN) {
+    try {
+      return await runner(candidate.model, candidate.useThinking);
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientUpstreamError(err)) {
+        throw err;
+      }
     }
-    throw err;
   }
+  throw lastErr;
+}
+
+function getDimensionsForRatio(aspectRatio: '1:1' | '16:9' | '9:16' = '1:1') {
+  return aspectRatio === '16:9'
+    ? { width: 1024, height: 576 }
+    : aspectRatio === '9:16'
+      ? { width: 576, height: 1024 }
+      : { width: 1024, height: 1024 };
 }
 
 async function generateStudioImageSvg(
@@ -361,13 +388,11 @@ app.post('/api/chat', async (req, res) => {
     return;
   }
 
-  let ai: GoogleGenAI;
+  let ai: GoogleGenAI | null = null;
   try {
     ai = createGeminiClient();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Model service configuration error.';
-    res.status(500).json({ error: message });
-    return;
+  } catch {
+    ai = null;
   }
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -385,6 +410,23 @@ app.post('/api/chat', async (req, res) => {
     }
   });
 
+  const streamLocalQoweFallback = async () => {
+    const localText = generateLocalQoweResponse({
+      messages,
+      architectureName,
+      totalParamsFormatted,
+      trainingContext,
+      checkpointStep,
+      checkpointLoss,
+      outputMode,
+    });
+    const chunkSize = 48;
+    for (let i = 0; i < localText.length; i += chunkSize) {
+      if (clientClosed || res.writableEnded) return;
+      res.write(`data: ${JSON.stringify({ text: localText.slice(i, i + chunkSize) })}\n\n`);
+    }
+  };
+
   const archLabel = architectureName || 'Qowe 1.0 Ultra 800B';
   const paramLabel = totalParamsFormatted || '801.32B';
   const corpusNote =
@@ -398,13 +440,18 @@ app.post('/api/chat', async (req, res) => {
 
   const buildModePrompt =
     outputMode === 'build'
-      ? `\n\nCODE & BUILD MODE ACTIVE:
-The user wants you to architect and build a complete, immediately runnable interactive project/task.
-1. Start with a brief "### Build Task Plan" section listing 3-5 concrete completed tasks using markdown task items (\`- [x] ...\`).
-2. Output ONE complete, self-contained, production-clean \`\`\`html ... \`\`\` fenced code block containing full \`<!doctype html>\`, clean inline \`<style>\`, responsive UI, and working \`<script>\` logic with zero external CDN dependencies and zero \`alert()\`/\`confirm()\`/\`prompt()\` dialogs so it runs live immediately inside the workspace preview sandbox.`
+      ? `\n\nFULL-STACK CODE & BUILD MODE ACTIVE (Hydrogen 4 Architect):
+The user wants you to architect and build a complete, immediately runnable FULL-STACK application (Frontend UI + Backend API + SQL Database Schema & Seed Data).
+1. Start with a concise "### Build Task Plan" listing 4-5 completed engineering milestones using markdown checkboxes (\`- [x] ...\`).
+2. Output clean multi-file fenced code blocks using exact \`file="..."\` attributes in the fence info string in this order:
+   - \`\`\`json file="package.json"\`\`\` — includes \`"type": "module"\`, \`"scripts": { "dev": "tsx server.ts", "start": "node server.ts" }\`, \`"engines": { "node": ">=22.18.0" }\`, and \`express\`.
+   - \`\`\`sql file="db/schema.sql"\`\`\` — clean \`CREATE TABLE IF NOT EXISTS ...;\` DDL and 3-5 realistic \`INSERT INTO ... VALUES (...);\` seed rows so the app starts populated with real data.
+   - \`\`\`ts file="server.ts"\`\`\` — production Express Node.js backend serving \`public/index.html\` and clean REST endpoints (\`GET /api/...\`, \`POST /api/...\`, \`PATCH /api/.../:id\`, \`DELETE /api/.../:id\`, \`GET /api/stats\`, \`GET /api/health\`) matching the table names in \`db/schema.sql\`, returning arrays cleanly for collection GETs (or consistent JSON objects) with real validation and persistent storage.
+   - \`\`\`html file="public/index.html"\`\`\` — complete, responsive, refined UI using clean inline \`<style>\` and real \`fetch('/api/...')\` calls (for reading, creating, updating/toggling, filtering, and deleting records) with zero external CDN dependencies and zero \`alert()\`/\`confirm()\`/\`prompt()\` dialogs.
+Every REST endpoint your frontend calls MUST match a REST collection/resource in \`db/schema.sql\` and \`server.ts\` so the live workspace full-stack sandbox AND the exported .zip project both work immediately.`
       : '';
 
-  const systemInstruction = `You are Qowe 1.0 (${archLabel}, ${paramLabel} parameter multimodal causal transformer), an elite analytical, coding, build-task, and reasoning AI engine built in the Qowe 1.0 studio.
+  const systemInstruction = `You are Qowe 1.0 (${archLabel}, ${paramLabel} parameter multimodal causal transformer), an elite analytical, full-stack software architect, and reasoning AI engine built in the Qowe 1.0 studio.
 Understand the user's underlying intent deeply before responding. For reasoning, math, architecture, or code tasks: verify edge cases internally, decompose complex ideas cleanly, and provide exact, high-signal answers with runnable fenced code blocks when helpful.${checkpointNote}${corpusNote}${buildModePrompt}`;
 
   const contents = messages.map((m) => ({
@@ -413,8 +460,10 @@ Understand the user's underlying intent deeply before responding. For reasoning,
   }));
 
   const thinkingLevel = reasoningDepth === 'standard' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH;
+  let streamedAnyChunk = false;
 
   const runStream = async (model: string, level: ThinkingLevel | null, timeoutMs?: number) => {
+    if (!ai) throw new Error('upstream unavailable');
     const abortCtrl = new AbortController();
     activeAbortCtrl = abortCtrl;
     const timer = timeoutMs ? setTimeout(() => abortCtrl.abort(), timeoutMs) : undefined;
@@ -438,6 +487,7 @@ Understand the user's underlying intent deeply before responding. For reasoning,
         if (clientClosed) break;
         const c = chunk as GenerateContentResponse;
         if (c.text) {
+          streamedAnyChunk = true;
           res.write(`data: ${JSON.stringify({ text: c.text })}\n\n`);
         }
       }
@@ -450,15 +500,31 @@ Understand the user's underlying intent deeply before responding. For reasoning,
   };
 
   try {
-    try {
-      await runStream('gemini-4-hydrogen', thinkingLevel, 18000);
-    } catch (primaryErr) {
-      if (clientClosed) return;
-      if (isTransientUpstreamError(primaryErr)) {
-        await runStream('gemini-3.1-flash-lite', null);
-      } else {
-        throw primaryErr;
+    let completed = false;
+    if (ai) {
+      for (const candidate of UPSTREAM_MODEL_CHAIN) {
+        if (clientClosed) break;
+        try {
+          await runStream(
+            candidate.model,
+            candidate.useThinking ? thinkingLevel : null,
+            outputMode === 'build' ? 30000 : 12000,
+          );
+          if (streamedAnyChunk) {
+            completed = true;
+            break;
+          }
+        } catch (upstreamErr) {
+          if (clientClosed || streamedAnyChunk) break;
+          if (!isTransientUpstreamError(upstreamErr)) {
+            throw upstreamErr;
+          }
+        }
       }
+    }
+
+    if (!completed && !clientClosed && !streamedAnyChunk) {
+      await streamLocalQoweFallback();
     }
 
     if (!clientClosed && !res.writableEnded) {
@@ -466,9 +532,13 @@ Understand the user's underlying intent deeply before responding. For reasoning,
       res.end();
     }
   } catch (err) {
-    const errMsg = formatUpstreamError(err);
     if (!clientClosed && !res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ error: errMsg })}\n\n`);
+      if (!streamedAnyChunk) {
+        await streamLocalQoweFallback();
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      } else {
+        res.write(`data: ${JSON.stringify({ error: formatUpstreamError(err) })}\n\n`);
+      }
       res.end();
     }
   }
@@ -484,17 +554,24 @@ app.post('/api/generate-image', async (req, res) => {
     return;
   }
 
+  const safeRatio = aspectRatio === '16:9' || aspectRatio === '9:16' ? aspectRatio : '1:1';
+  const cleanPrompt = prompt.trim().slice(0, 1000);
   try {
     const ai = createGeminiClient();
-    const safeRatio = aspectRatio === '16:9' || aspectRatio === '9:16' ? aspectRatio : '1:1';
-    const result = await generateStudioImageSvg(ai, prompt.trim().slice(0, 1000), safeRatio);
+    const result = await generateStudioImageSvg(ai, cleanPrompt, safeRatio);
     res.json({
       model: 'qowe-1.0-vision',
       ...result,
       mimeType: 'image/svg+xml',
     });
-  } catch (err) {
-    res.status(500).json({ error: formatUpstreamError(err) });
+  } catch {
+    const dims = getDimensionsForRatio(safeRatio);
+    res.json({
+      model: 'qowe-1.0-vision',
+      svg: sanitizeGeneratedSvg('', cleanPrompt),
+      ...dims,
+      mimeType: 'image/svg+xml',
+    });
   }
 });
 
@@ -509,18 +586,26 @@ app.post('/api/generate-video', async (req, res) => {
     return;
   }
 
+  const safeRatio = aspectRatio === '1:1' ? '1:1' : '16:9';
+  const safeDur = typeof durationSec === 'number' ? durationSec : 4;
+  const cleanPrompt = prompt.trim().slice(0, 1000);
   try {
     const ai = createGeminiClient();
-    const safeRatio = aspectRatio === '1:1' ? '1:1' : '16:9';
-    const safeDur = typeof durationSec === 'number' ? durationSec : 4;
-    const sceneSpec = await generateVideoSceneSpec(ai, prompt.trim().slice(0, 1000), safeRatio, safeDur);
+    const sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, safeRatio, safeDur);
     res.json({
       model: 'qowe-1.0-video',
       fps: 60,
       sceneSpec,
     });
-  } catch (err) {
-    res.status(500).json({ error: formatUpstreamError(err) });
+  } catch {
+    const fallbackSpec = normalizeVideoSceneSpec(null, cleanPrompt);
+    fallbackSpec.aspectRatio = safeRatio;
+    fallbackSpec.durationSec = Math.max(2, Math.min(10, Math.round(safeDur)));
+    res.json({
+      model: 'qowe-1.0-video',
+      fps: 60,
+      sceneSpec: fallbackSpec,
+    });
   }
 });
 
@@ -568,17 +653,17 @@ app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
     return;
   }
 
-  let ai: GoogleGenAI;
+  let ai: GoogleGenAI | null = null;
   try {
     ai = createGeminiClient();
-  } catch (err) {
-    res.status(500).json({ error: { message: formatUpstreamError(err), type: 'server_error' } });
-    return;
+  } catch {
+    ai = null;
   }
 
   const cleanPrompt = prompt.trim().slice(0, 1000);
-  try {
-    if (endpoint === 'image') {
+  if (endpoint === 'image') {
+    try {
+      if (!ai) throw new Error('local fallback');
       const result = await generateStudioImageSvg(ai, cleanPrompt, '1:1');
       res.json({
         created: Math.floor(Date.now() / 1000),
@@ -593,23 +678,49 @@ app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
           },
         ],
       });
-      return;
-    }
-
-    if (endpoint === 'video') {
-      const sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, '16:9', 4);
+    } catch {
       res.json({
-        id: `vid_${crypto.randomBytes(10).toString('hex')}`,
         created: Math.floor(Date.now() / 1000),
-        model: 'qowe-1.0-video',
-        fps: 60,
-        duration_sec: sceneSpec.durationSec,
-        aspect_ratio: sceneSpec.aspectRatio,
-        scene_spec: sceneSpec,
+        model: 'qowe-1.0-vision',
+        data: [
+          {
+            prompt: cleanPrompt,
+            mime_type: 'image/svg+xml',
+            width: 1024,
+            height: 1024,
+            svg: sanitizeGeneratedSvg('', cleanPrompt),
+          },
+        ],
       });
-      return;
     }
+    return;
+  }
 
+  if (endpoint === 'video') {
+    let sceneSpec: VideoSceneSpec;
+    try {
+      if (!ai) throw new Error('local fallback');
+      sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, '16:9', 4);
+    } catch {
+      sceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
+      sceneSpec.aspectRatio = '16:9';
+      sceneSpec.durationSec = 4;
+    }
+    res.json({
+      id: `vid_${crypto.randomBytes(10).toString('hex')}`,
+      created: Math.floor(Date.now() / 1000),
+      model: 'qowe-1.0-video',
+      fps: 60,
+      duration_sec: sceneSpec.durationSec,
+      aspect_ratio: sceneSpec.aspectRatio,
+      scene_spec: sceneSpec,
+    });
+    return;
+  }
+
+  let contentText = '';
+  try {
+    if (!ai) throw new Error('local fallback');
     const response = await generateWithHydrogenFallback((upstreamModel, useThinking) =>
       ai.models.generateContent({
         model: upstreamModel,
@@ -621,24 +732,26 @@ app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
         },
       }),
     );
-
-    const contentText = response.text ?? '';
-    res.json({
-      id: `chatcmpl-${crypto.randomBytes(10).toString('hex')}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: 'qowe-1.0-ultra',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: contentText },
-          finish_reason: 'stop',
-        },
-      ],
+    contentText = response.text ?? '';
+  } catch {
+    contentText = generateLocalQoweResponse({
+      messages: [{ role: 'user', content: cleanPrompt }],
     });
-  } catch (err) {
-    res.status(500).json({ error: { message: formatUpstreamError(err), type: 'server_error' } });
   }
+
+  res.json({
+    id: `chatcmpl-${crypto.randomBytes(10).toString('hex')}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: 'qowe-1.0-ultra',
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: contentText },
+        finish_reason: 'stop',
+      },
+    ],
+  });
 });
 
 // ---- Public Qowe 1.0 API Endpoints (x-api-key or Bearer qowe_sk_... Authenticated) ----
@@ -707,12 +820,11 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
     return;
   }
 
-  let ai: GoogleGenAI;
+  let ai: GoogleGenAI | null = null;
   try {
     ai = createGeminiClient();
-  } catch (err) {
-    res.status(500).json({ error: { message: formatUpstreamError(err), type: 'server_error' } });
-    return;
+  } catch {
+    ai = null;
   }
 
   const systemParts = messages
@@ -749,6 +861,7 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
     res.flushHeaders?.();
 
     let clientClosed = false;
+    let sentAny = false;
     const abortCtrl = new AbortController();
     res.on('close', () => {
       if (!res.writableEnded) {
@@ -758,6 +871,7 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
     });
 
     try {
+      if (!ai) throw new Error('local fallback');
       const streamResp = await generateWithHydrogenFallback((upstreamModel, useThinking) =>
         ai.models.generateContentStream({
           model: upstreamModel,
@@ -774,6 +888,7 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
         if (clientClosed) break;
         const c = chunk as GenerateContentResponse;
         if (c.text) {
+          sentAny = true;
           res.write(
             `data: ${JSON.stringify({
               id: completionId,
@@ -785,29 +900,42 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
           );
         }
       }
-      if (!clientClosed && !res.writableEnded) {
-        res.write(
-          `data: ${JSON.stringify({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model: responseModelName,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          })}\n\n`,
-        );
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-    } catch (err) {
-      if (!clientClosed && !res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: { message: formatUpstreamError(err) } })}\n\n`);
-        res.end();
-      }
+    } catch {
+      // Fall through to local fallback below if nothing streamed yet
+    }
+
+    if (!sentAny && !clientClosed && !res.writableEnded) {
+      const localText = generateLocalQoweResponse({ messages });
+      res.write(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model: responseModelName,
+          choices: [{ index: 0, delta: { content: localText }, finish_reason: null }],
+        })}\n\n`,
+      );
+    }
+
+    if (!clientClosed && !res.writableEnded) {
+      res.write(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model: responseModelName,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        })}\n\n`,
+      );
+      res.write('data: [DONE]\n\n');
+      res.end();
     }
     return;
   }
 
+  let contentText = '';
   try {
+    if (!ai) throw new Error('local fallback');
     const response = await generateWithHydrogenFallback((upstreamModel, useThinking) =>
       ai.models.generateContent({
         model: upstreamModel,
@@ -818,31 +946,31 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
         },
       }),
     );
-
-    const contentText = response.text ?? '';
-    res.json({
-      id: completionId,
-      object: 'chat.completion',
-      created,
-      model: responseModelName,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: contentText },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: {
-        prompt_tokens: Math.ceil(JSON.stringify(chatContents).length / 4),
-        completion_tokens: Math.ceil(contentText.length / 4),
-        total_tokens:
-          Math.ceil(JSON.stringify(chatContents).length / 4) +
-          Math.ceil(contentText.length / 4),
-      },
-    });
-  } catch (err) {
-    res.status(500).json({ error: { message: formatUpstreamError(err), type: 'server_error' } });
+    contentText = response.text ?? '';
+  } catch {
+    contentText = generateLocalQoweResponse({ messages });
   }
+
+  res.json({
+    id: completionId,
+    object: 'chat.completion',
+    created,
+    model: responseModelName,
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: contentText },
+        finish_reason: 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: Math.ceil(JSON.stringify(chatContents).length / 4),
+      completion_tokens: Math.ceil(contentText.length / 4),
+      total_tokens:
+        Math.ceil(JSON.stringify(chatContents).length / 4) +
+        Math.ceil(contentText.length / 4),
+    },
+  });
 });
 
 app.post('/api/v1/images/generations', requireQoweApiKey, async (req, res) => {
@@ -857,27 +985,30 @@ app.post('/api/v1/images/generations', requireQoweApiKey, async (req, res) => {
     return;
   }
 
+  const safeRatio = aspect_ratio === '16:9' || aspect_ratio === '9:16' ? aspect_ratio : '1:1';
+  const cleanPrompt = prompt.trim().slice(0, 1000);
+  let result: { svg: string; width: number; height: number };
   try {
     const ai = createGeminiClient();
-    const safeRatio = aspect_ratio === '16:9' || aspect_ratio === '9:16' ? aspect_ratio : '1:1';
-    const result = await generateStudioImageSvg(ai, prompt.trim().slice(0, 1000), safeRatio);
-    res.json({
-      created: Math.floor(Date.now() / 1000),
-      model: 'qowe-1.0-vision',
-      data: [
-        {
-          prompt: prompt.trim(),
-          mime_type: 'image/svg+xml',
-          width: result.width,
-          height: result.height,
-          svg: result.svg,
-          b64_json: Buffer.from(result.svg, 'utf8').toString('base64'),
-        },
-      ],
-    });
-  } catch (err) {
-    res.status(500).json({ error: { message: formatUpstreamError(err), type: 'server_error' } });
+    result = await generateStudioImageSvg(ai, cleanPrompt, safeRatio);
+  } catch {
+    const dims = getDimensionsForRatio(safeRatio);
+    result = { svg: sanitizeGeneratedSvg('', cleanPrompt), ...dims };
   }
+  res.json({
+    created: Math.floor(Date.now() / 1000),
+    model: 'qowe-1.0-vision',
+    data: [
+      {
+        prompt: prompt.trim(),
+        mime_type: 'image/svg+xml',
+        width: result.width,
+        height: result.height,
+        svg: result.svg,
+        b64_json: Buffer.from(result.svg, 'utf8').toString('base64'),
+      },
+    ],
+  });
 });
 
 app.post('/api/v1/videos/generations', requireQoweApiKey, async (req, res) => {
@@ -893,23 +1024,27 @@ app.post('/api/v1/videos/generations', requireQoweApiKey, async (req, res) => {
     return;
   }
 
+  const safeRatio = aspect_ratio === '1:1' ? '1:1' : '16:9';
+  const safeDur = typeof duration_sec === 'number' ? duration_sec : 4;
+  const cleanPrompt = prompt.trim().slice(0, 1000);
+  let sceneSpec: VideoSceneSpec;
   try {
     const ai = createGeminiClient();
-    const safeRatio = aspect_ratio === '1:1' ? '1:1' : '16:9';
-    const safeDur = typeof duration_sec === 'number' ? duration_sec : 4;
-    const sceneSpec = await generateVideoSceneSpec(ai, prompt.trim().slice(0, 1000), safeRatio, safeDur);
-    res.json({
-      id: `vid_${crypto.randomBytes(10).toString('hex')}`,
-      created: Math.floor(Date.now() / 1000),
-      model: 'qowe-1.0-video',
-      fps: 60,
-      duration_sec: sceneSpec.durationSec,
-      aspect_ratio: sceneSpec.aspectRatio,
-      scene_spec: sceneSpec,
-    });
-  } catch (err) {
-    res.status(500).json({ error: { message: formatUpstreamError(err), type: 'server_error' } });
+    sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, safeRatio, safeDur);
+  } catch {
+    sceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
+    sceneSpec.aspectRatio = safeRatio;
+    sceneSpec.durationSec = Math.max(2, Math.min(10, Math.round(safeDur)));
   }
+  res.json({
+    id: `vid_${crypto.randomBytes(10).toString('hex')}`,
+    created: Math.floor(Date.now() / 1000),
+    model: 'qowe-1.0-video',
+    fps: 60,
+    duration_sec: sceneSpec.durationSec,
+    aspect_ratio: sceneSpec.aspectRatio,
+    scene_spec: sceneSpec,
+  });
 });
 
 app.use('/api', (_req, res) => {

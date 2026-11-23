@@ -19,6 +19,11 @@ import {
   normalizeVideoSceneSpec,
   sanitizeGeneratedSvg,
 } from './intentAndMedia';
+import {
+  createProjectZipBytes,
+  executeVirtualApiRequest,
+  parseFullStackFiles,
+} from './fullStackProject';
 
 test('resolveBaseUrls avoids advertising cookie-gated ais-dev URLs as public API base URLs', () => {
   const devCtx = resolveBaseUrls({
@@ -173,14 +178,101 @@ test('extractApiKeyFromHeaders supports Bearer, x-api-key, and x-qowe-api-key he
   assert.equal(extractApiKeyFromHeaders({}), undefined);
 });
 
-test('detectChatIntent routes natural image/video generation prompts without hijacking code questions', () => {
+test('detectChatIntent routes natural image/video/full-stack build prompts without hijacking code questions', () => {
   assert.equal(detectChatIntent('generate an image of a cyberpunk cat', 'text'), 'image');
   assert.equal(detectChatIntent('draw a golden mountain sunrise', 'text'), 'image');
   assert.equal(detectChatIntent('generate a video of a rocket launching into mars', 'text'), 'video');
   assert.equal(detectChatIntent('animate ocean waves under neon lights', 'text'), 'video');
+  assert.equal(detectChatIntent('build a full-stack issue tracker with express api and sql database', 'text'), 'build');
+  assert.equal(detectChatIntent('how does a full-stack database api work', 'text'), 'text');
   assert.equal(detectChatIntent('explain how video compression works in python', 'text'), 'text');
   assert.equal(detectChatIntent('write html code to draw a square', 'text'), 'text');
   assert.equal(detectChatIntent('hello how are you', 'build'), 'build');
+});
+
+test('parseFullStackFiles extracts multi-file project, SQL seed rows, Express routes, virtual CRUD API, and PKZIP bundle', () => {
+  const markdown = `
+### Build Task Plan
+- [x] SQL schema
+- [x] Express API
+- [x] Frontend UI
+
+\`\`\`json file="package.json"
+{ "name": "sprint-tracker", "scripts": { "start": "node server.ts" }, "dependencies": { "express": "^4.21.2" } }
+\`\`\`
+
+\`\`\`sql file="db/schema.sql"
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  status TEXT DEFAULT 'open',
+  completed BOOLEAN DEFAULT FALSE
+);
+INSERT INTO tasks (id, title, status, completed) VALUES
+  (1, 'Design REST API', 'done', true),
+  (2, 'Build UI board', 'open', false);
+\`\`\`
+
+\`\`\`ts file="server.ts"
+import express from 'express';
+const app = express();
+app.get('/api/tasks', (_req, res) => res.json([]));
+app.post('/api/tasks', (_req, res) => res.status(201).json({}));
+app.delete('/api/tasks/:id', (_req, res) => res.json({ deleted: true }));
+\`\`\`
+
+\`\`\`html file="public/index.html"
+<!doctype html><html><head><title>Sprint Tracker</title></head><body><h1>Tracker</h1></body></html>
+\`\`\`
+`;
+
+  const parsed = parseFullStackFiles(markdown);
+  assert.ok(parsed);
+  assert.equal(parsed.isFullStack, true);
+  assert.equal(parsed.title, 'Sprint Tracker');
+  assert.equal(parsed.files.length, 4);
+  assert.equal(parsed.routes.length, 3);
+  assert.equal(parsed.initialTables.tasks.length, 2);
+  assert.equal(parsed.initialTables.tasks[0].title, 'Design REST API');
+
+  // Single HTML snippet stays as normal CodeBlock, not full-stack card
+  assert.equal(parseFullStackFiles('```html\n<!doctype html><html><body>Hi</body></html>\n```'), null);
+
+  // Virtual REST API CRUD execution against parsed seed database
+  const getRes = executeVirtualApiRequest(parsed.initialTables, { method: 'GET', url: '/api/tasks?status=open' });
+  assert.equal(getRes.response.status, 200);
+  assert.equal((getRes.response.body as unknown[]).length, 1);
+
+  const postRes = executeVirtualApiRequest(parsed.initialTables, {
+    method: 'POST',
+    url: '/api/tasks',
+    bodyText: JSON.stringify({ title: 'Ship v1.0', status: 'open', completed: false }),
+  });
+  assert.equal(postRes.response.status, 201);
+  assert.equal(postRes.mutated, true);
+  assert.equal(postRes.nextTables.tasks.length, 3);
+
+  const toggleRes = executeVirtualApiRequest(postRes.nextTables, {
+    method: 'POST',
+    url: '/api/tasks/2/toggle',
+  });
+  assert.equal(toggleRes.response.status, 200);
+  assert.equal((toggleRes.response.body as { completed: boolean }).completed, true);
+
+  const delRes = executeVirtualApiRequest(toggleRes.nextTables, {
+    method: 'DELETE',
+    url: '/api/tasks/1',
+  });
+  assert.equal(delRes.response.status, 200);
+  assert.equal(delRes.nextTables.tasks.length, 2);
+
+  // Verify PKZIP local header signature & non-empty bundle
+  const zipBytes = createProjectZipBytes(parsed.files);
+  assert.equal(zipBytes[0], 0x50); // 'P'
+  assert.equal(zipBytes[1], 0x4b); // 'K'
+  assert.equal(zipBytes[2], 0x03);
+  assert.equal(zipBytes[3], 0x04);
+  assert.ok(zipBytes.length > 500);
 });
 
 test('sanitizeGeneratedSvg strips scripts/handlers and ensures valid SVG attributes', () => {

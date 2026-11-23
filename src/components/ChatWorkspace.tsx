@@ -63,8 +63,8 @@ const STARTER_PROMPTS: {
   outputMode?: ChatOutputMode;
 }[] = [
   {
-    title: 'Build an Interactive Drum Pad App',
-    prompt: 'Build an interactive 8-pad Web Audio synthwave drum machine with tempo slider and pattern sequencer.',
+    title: 'Build a Full-Stack SaaS Tracker',
+    prompt: 'Build a full-stack project & sprint issue tracker with Express REST API, SQL schema with seed issues, live search/status filters, and persistent database storage.',
     outputMode: 'build',
   },
   {
@@ -207,18 +207,19 @@ const ChatMessageItem: React.FC<ChatMessageItemProps> = React.memo(
               )}
 
               {msg.videoData &&
-                Array.isArray(msg.videoData.frames) &&
-                msg.videoData.frames.length > 0 && (
+                ((Array.isArray(msg.videoData.frames) && msg.videoData.frames.length > 0) ||
+                  Boolean(msg.videoData.cinemaPayload)) && (
                   <div className="mt-3">
                     <CanvasMediaPlayer
-                      frames={msg.videoData.frames}
+                      frames={msg.videoData.frames ?? []}
                       width={msg.videoData.width}
                       height={msg.videoData.height}
                       fps={msg.videoData.fps}
                       audioTrack={msg.videoData.audioTrack}
                       cameraMotion={msg.videoData.cameraMotion}
+                      cinemaPayload={msg.videoData.cinemaPayload}
                       showScrubber
-                      label="Generated 60 fps audio + video by Qowe 1.0 trained from scratch"
+                      label="Generated 60 fps LTX-2.5 3D PBR audio + video"
                     />
                   </div>
                 )}
@@ -402,7 +403,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(
                       : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
                   }`}
                 >
-                  From-Scratch (Audio + 60fps)
+                  LTX-2.5 3D (Audio + 60fps)
                 </button>
                 <button
                   type="button"
@@ -436,7 +437,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(
               onKeyDown={handleKeyDown}
               placeholder={
                 outputMode === 'build'
-                  ? 'Describe an app, game, or build task for Qowe 1.0 to code & run live...'
+                  ? 'Describe a full-stack app (Frontend + Backend API + SQL Database) to architect, run live & export .zip...'
                   : outputMode === 'image'
                     ? 'Describe an image for Qowe 1.0 to generate...'
                     : outputMode === 'video'
@@ -459,7 +460,7 @@ const ChatComposer: React.FC<ChatComposerProps> = React.memo(
             ) : (
               <button
                 type="submit"
-                disabled={!draft.trim() || localUntrained}
+                disabled={!draft.trim()}
                 aria-label="Send message"
                 className="p-2.5 rounded-full bg-[#007aff] hover:bg-[#0066d6] dark:bg-[#0a84ff] dark:hover:bg-[#1a8cff] disabled:bg-black/[0.08] dark:disabled:bg-white/[0.08] disabled:text-neutral-400 text-white transition-colors shrink-0"
               >
@@ -544,7 +545,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 : outputMode === 'video'
                   ? '60 FPS Motion Video Generation'
                   : outputMode === 'build'
-                    ? 'Code & Build Tasks (Live Sandbox)'
+                    ? 'Full-Stack App Builder (Frontend + API + SQL)'
                     : engineMode === 'assistant'
                       ? `Smart Assistant (${reasoningDepth === 'deep' ? 'Deep Reasoning' : 'Standard'})`
                       : checkpoint
@@ -738,10 +739,10 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
             <div className="mb-6 p-4 rounded-[22px] border border-amber-300/60 dark:border-amber-800/60 bg-amber-50/90 dark:bg-amber-950/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="space-y-1">
                 <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
-                  No local from-scratch text checkpoint trained yet
+                  Local from-scratch weights ready to auto-train
                 </p>
                 <p className="text-xs text-amber-800 dark:text-amber-300">
-                  Train Qowe 1.0 text weights from scratch on your dataset first, or switch back to Assistant mode.
+                  Send any message to auto-train Qowe 1.0 locally from scratch on your dataset, or customize steps in Training Studio.
                 </p>
               </div>
               <button
