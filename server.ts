@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, type GenerateContentResponse, ThinkingLevel, Type } from '@google/genai';
 import {
   QoweApiKeyStore,
   extractApiKeyFromHeaders,
@@ -17,7 +16,7 @@ import {
   sanitizeGeneratedSvg,
   type VideoSceneSpec,
 } from './src/engine/intentAndMedia.ts';
-import { generateLocalQoweResponse } from './server/localQoweFallback.ts';
+import { generateQoweAssistantResponse } from './src/engine/qoweAssistantEngine.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,92 +39,8 @@ interface AuthenticatedRequest extends Request {
   qoweKey?: PublicQoweApiKeyRecord;
 }
 
-function createGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured. Add a valid key in Settings > Secrets.');
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      timeout: 45000,
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
-
-function formatUpstreamError(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  try {
-    const outer = JSON.parse(raw) as { error?: { message?: string; code?: number } };
-    const innerRaw = outer?.error?.message;
-    if (typeof innerRaw === 'string') {
-      try {
-        const inner = JSON.parse(innerRaw) as { error?: { message?: string; code?: number } };
-        if (inner?.error?.message) return inner.error.message;
-      } catch {
-        return innerRaw;
-      }
-    }
-  } catch {
-    // Raw is plain text
-  }
-  return raw || 'Failed to generate response.';
-}
-
-function isTransientUpstreamError(err: unknown): boolean {
-  const msg = formatUpstreamError(err).toLowerCase();
-  const status = (err as { status?: number })?.status;
-  if (status === 401 || status === 403) return false;
-  return (
-    status === 408 ||
-    status === 429 ||
-    (typeof status === 'number' && status >= 500) ||
-    msg.includes('500') ||
-    msg.includes('502') ||
-    msg.includes('503') ||
-    msg.includes('504') ||
-    msg.includes('high demand') ||
-    msg.includes('try again later') ||
-    msg.includes('temporarily') ||
-    msg.includes('quota') ||
-    msg.includes('resource_exhausted') ||
-    msg.includes('rate limit') ||
-    msg.includes('too many requests') ||
-    msg.includes('capacity') ||
-    msg.includes('unavailable') ||
-    msg.includes('internal') ||
-    msg.includes('overloaded') ||
-    msg.includes('timeout') ||
-    msg.includes('aborted') ||
-    msg.includes('fetch failed') ||
-    msg.includes('not configured')
-  );
-}
-
-const UPSTREAM_MODEL_CHAIN: { model: string; useThinking: boolean }[] = [
-  { model: 'gemini-4-hydrogen', useThinking: true },
-  { model: 'gemini-3.1-flash-lite', useThinking: false },
-  { model: 'gemini-2.5-flash', useThinking: false },
-];
-
-async function generateWithHydrogenFallback<T>(
-  runner: (model: string, useThinking: boolean) => Promise<T>,
-): Promise<T> {
-  let lastErr: unknown;
-  for (const candidate of UPSTREAM_MODEL_CHAIN) {
-    try {
-      return await runner(candidate.model, candidate.useThinking);
-    } catch (err) {
-      lastErr = err;
-      if (!isTransientUpstreamError(err)) {
-        throw err;
-      }
-    }
-  }
-  throw lastErr;
+function formatServerError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err || 'Unexpected server error.');
 }
 
 function getDimensionsForRatio(aspectRatio: '1:1' | '16:9' | '9:16' = '1:1') {
@@ -134,114 +49,6 @@ function getDimensionsForRatio(aspectRatio: '1:1' | '16:9' | '9:16' = '1:1') {
     : aspectRatio === '9:16'
       ? { width: 576, height: 1024 }
       : { width: 1024, height: 1024 };
-}
-
-async function generateStudioImageSvg(
-  ai: GoogleGenAI,
-  prompt: string,
-  aspectRatio: '1:1' | '16:9' | '9:16' = '1:1',
-): Promise<{ svg: string; width: number; height: number }> {
-  const dimensions =
-    aspectRatio === '16:9'
-      ? { width: 1024, height: 576 }
-      : aspectRatio === '9:16'
-        ? { width: 576, height: 1024 }
-        : { width: 1024, height: 1024 };
-
-  const svgPrompt = `Create a richly detailed, studio-quality vector illustration in pure SVG for: "${prompt}".
-Canvas requirements:
-- Output ONLY raw <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${dimensions.width} ${dimensions.height}" width="${dimensions.width}" height="${dimensions.height}">...</svg> with no markdown fences and no commentary.
-- Craft cohesive atmospheric backgrounds using multi-stop <linearGradient> and <radialGradient> lighting, soft glows, depth layers (far backdrop, midground environment, crisp hero foreground subject), expressive silhouettes/shapes, specular highlights, and realistic cast shadows.
-- Never use <script>, <foreignObject>, external image URLs, or event attributes.`;
-
-  const response = await generateWithHydrogenFallback((model, useThinking) =>
-    ai.models.generateContent({
-      model,
-      contents: svgPrompt,
-      config: {
-        systemInstruction:
-          'You are an elite digital illustrator for Qowe 1.0. Produce vivid, detailed, visually cohesive SVG artwork matching the exact subject, lighting, mood, and composition requested.',
-        ...(useThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
-      },
-    }),
-  );
-
-  const svg = sanitizeGeneratedSvg(response.text ?? '', prompt);
-  return { svg, ...dimensions };
-}
-
-async function generateVideoSceneSpec(
-  ai: GoogleGenAI,
-  prompt: string,
-  aspectRatio: '16:9' | '1:1' = '16:9',
-  durationSec = 4,
-): Promise<VideoSceneSpec> {
-  const response = await generateWithHydrogenFallback((model, useThinking) =>
-    ai.models.generateContent({
-      model,
-      contents: `Design a vivid 60 fps animated cinematic scene specification for the prompt: "${prompt}".
-Desired aspectRatio: "${aspectRatio}", durationSec: ${Math.max(2, Math.min(10, Math.round(durationSec)))}.
-Pick rich hex colors, the best matching backdrop, celestial lighting, atmospheric weather, waterReflection, and 1-3 animated actors matching the subjects in the prompt.`,
-      config: {
-        systemInstruction:
-          'You are the 60 fps motion scene director for Qowe 1.0. Output clean JSON matching the exact scene schema.',
-        responseMimeType: 'application/json',
-        ...(useThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            mood: { type: Type.STRING },
-            aspectRatio: { type: Type.STRING },
-            durationSec: { type: Type.NUMBER },
-            skyTop: { type: Type.STRING },
-            skyBottom: { type: Type.STRING },
-            horizonGlow: { type: Type.STRING },
-            groundTop: { type: Type.STRING },
-            groundBottom: { type: Type.STRING },
-            accent: { type: Type.STRING },
-            secondary: { type: Type.STRING },
-            celestial: { type: Type.STRING },
-            backdrop: { type: Type.STRING },
-            weather: { type: Type.STRING },
-            waterReflection: { type: Type.BOOLEAN },
-            cameraPan: { type: Type.NUMBER },
-            cameraZoom: { type: Type.NUMBER },
-            caption: { type: Type.STRING },
-            actors: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  type: { type: Type.STRING },
-                  label: { type: Type.STRING },
-                  x: { type: Type.NUMBER },
-                  y: { type: Type.NUMBER },
-                  scale: { type: Type.NUMBER },
-                  color: { type: Type.STRING },
-                  secondaryColor: { type: Type.STRING },
-                  motion: { type: Type.STRING },
-                  speed: { type: Type.NUMBER },
-                  trail: { type: Type.BOOLEAN },
-                },
-              },
-            },
-          },
-        },
-      },
-    }),
-  );
-
-  let parsed: unknown = null;
-  try {
-    parsed = JSON.parse((response.text ?? '{}').trim());
-  } catch {
-    parsed = null;
-  }
-  const normalized = normalizeVideoSceneSpec(parsed, prompt);
-  normalized.aspectRatio = aspectRatio;
-  normalized.durationSec = Math.max(2, Math.min(10, Math.round(durationSec)));
-  return normalized;
 }
 
 function getBaseUrls(req: Request): BaseUrlResolution {
@@ -305,11 +112,36 @@ async function requireQoweApiKey(
   next();
 }
 
+const QOWE_MODELS_LIST = [
+  {
+    id: 'qowe-1.0-ultra',
+    object: 'model',
+    owned_by: 'qowe',
+    capabilities: ['chat', 'reasoning', 'code', 'build'],
+    parameters: '801.32B',
+  },
+  {
+    id: 'qowe-1.0-vision',
+    object: 'model',
+    owned_by: 'qowe',
+    capabilities: ['text-to-image'],
+    format: 'image/svg+xml',
+  },
+  {
+    id: 'qowe-1.0-video',
+    object: 'model',
+    owned_by: 'qowe',
+    capabilities: ['text-to-video'],
+    fps: 60,
+  },
+];
+
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     model: 'Qowe 1.0',
-    hasKey: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+    engine: 'qowe-1.0-self-hosted',
+    hasKey: true,
   });
 });
 
@@ -319,7 +151,7 @@ app.get('/api/usage', async (_req, res) => {
     const usage = await usageTracker.getSummary();
     res.json({ usage });
   } catch (err) {
-    res.status(500).json({ error: formatUpstreamError(err) });
+    res.status(500).json({ error: formatServerError(err) });
   }
 });
 
@@ -328,7 +160,7 @@ app.get('/api/keys', async (req, res) => {
     const [keys, usage] = await Promise.all([keyStore.listKeys(), usageTracker.getSummary()]);
     res.json({ keys, usage, baseUrls: getBaseUrls(req) });
   } catch (err) {
-    res.status(500).json({ error: formatUpstreamError(err) });
+    res.status(500).json({ error: formatServerError(err) });
   }
 });
 
@@ -356,7 +188,7 @@ app.delete('/api/keys/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- Studio Internal Endpoints ----
+// ---- Studio Internal Endpoints (100% Self-Hosted Qowe 1.0 Engine) ----
 interface IncomingMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -372,7 +204,7 @@ app.post('/api/chat', async (req, res) => {
     checkpointLoss,
     reasoningDepth,
     outputMode,
-  } = req.body as {
+  } = (req.body ?? {}) as {
     messages?: IncomingMessage[];
     architectureName?: string;
     totalParamsFormatted?: string;
@@ -388,13 +220,6 @@ app.post('/api/chat', async (req, res) => {
     return;
   }
 
-  let ai: GoogleGenAI | null = null;
-  try {
-    ai = createGeminiClient();
-  } catch {
-    ai = null;
-  }
-
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -402,129 +227,28 @@ app.post('/api/chat', async (req, res) => {
   res.write(': stream-open\n\n');
 
   let clientClosed = false;
-  let activeAbortCtrl: AbortController | null = null;
   res.on('close', () => {
     if (!res.writableEnded) {
       clientClosed = true;
-      activeAbortCtrl?.abort();
     }
   });
 
-  const streamLocalQoweFallback = async () => {
-    const localText = generateLocalQoweResponse({
+  try {
+    const responseText = generateQoweAssistantResponse({
       messages,
       architectureName,
       totalParamsFormatted,
       trainingContext,
       checkpointStep,
       checkpointLoss,
+      reasoningDepth,
       outputMode,
     });
+
     const chunkSize = 48;
-    for (let i = 0; i < localText.length; i += chunkSize) {
-      if (clientClosed || res.writableEnded) return;
-      res.write(`data: ${JSON.stringify({ text: localText.slice(i, i + chunkSize) })}\n\n`);
-    }
-  };
-
-  const archLabel = architectureName || 'Qowe 1.0 Ultra 800B';
-  const paramLabel = totalParamsFormatted || '801.32B';
-  const corpusNote =
-    typeof trainingContext === 'string' && trainingContext.trim().length > 0
-      ? `\n\nThe user has also loaded the following custom training corpus into your Qowe 1.0 workspace (use it as domain context when relevant):\n"""\n${trainingContext.slice(0, 3000)}\n"""`
-      : '';
-  const checkpointNote =
-    typeof checkpointStep === 'number' && checkpointStep > 0
-      ? `\nActive local from-scratch training checkpoint: step ${checkpointStep}, cross-entropy loss ${typeof checkpointLoss === 'number' ? checkpointLoss.toFixed(3) : 'N/A'}.`
-      : '';
-
-  const buildModePrompt =
-    outputMode === 'build'
-      ? `\n\nFULL-STACK CODE & BUILD MODE ACTIVE (Hydrogen 4 Architect):
-The user wants you to architect and build a complete, immediately runnable FULL-STACK application (Frontend UI + Backend API + SQL Database Schema & Seed Data).
-1. Start with a concise "### Build Task Plan" listing 4-5 completed engineering milestones using markdown checkboxes (\`- [x] ...\`).
-2. Output clean multi-file fenced code blocks using exact \`file="..."\` attributes in the fence info string in this order:
-   - \`\`\`json file="package.json"\`\`\` — includes \`"type": "module"\`, \`"scripts": { "dev": "tsx server.ts", "start": "node server.ts" }\`, \`"engines": { "node": ">=22.18.0" }\`, and \`express\`.
-   - \`\`\`sql file="db/schema.sql"\`\`\` — clean \`CREATE TABLE IF NOT EXISTS ...;\` DDL and 3-5 realistic \`INSERT INTO ... VALUES (...);\` seed rows so the app starts populated with real data.
-   - \`\`\`ts file="server.ts"\`\`\` — production Express Node.js backend serving \`public/index.html\` and clean REST endpoints (\`GET /api/...\`, \`POST /api/...\`, \`PATCH /api/.../:id\`, \`DELETE /api/.../:id\`, \`GET /api/stats\`, \`GET /api/health\`) matching the table names in \`db/schema.sql\`, returning arrays cleanly for collection GETs (or consistent JSON objects) with real validation and persistent storage.
-   - \`\`\`html file="public/index.html"\`\`\` — complete, responsive, refined UI using clean inline \`<style>\` and real \`fetch('/api/...')\` calls (for reading, creating, updating/toggling, filtering, and deleting records) with zero external CDN dependencies and zero \`alert()\`/\`confirm()\`/\`prompt()\` dialogs.
-Every REST endpoint your frontend calls MUST match a REST collection/resource in \`db/schema.sql\` and \`server.ts\` so the live workspace full-stack sandbox AND the exported .zip project both work immediately.`
-      : '';
-
-  const systemInstruction = `You are Qowe 1.0 (${archLabel}, ${paramLabel} parameter multimodal causal transformer), an elite analytical, full-stack software architect, and reasoning AI engine built in the Qowe 1.0 studio.
-Understand the user's underlying intent deeply before responding. For reasoning, math, architecture, or code tasks: verify edge cases internally, decompose complex ideas cleanly, and provide exact, high-signal answers with runnable fenced code blocks when helpful.${checkpointNote}${corpusNote}${buildModePrompt}`;
-
-  const contents = messages.map((m) => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
-
-  const thinkingLevel = reasoningDepth === 'standard' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH;
-  let streamedAnyChunk = false;
-
-  const runStream = async (model: string, level: ThinkingLevel | null, timeoutMs?: number) => {
-    if (!ai) throw new Error('upstream unavailable');
-    const abortCtrl = new AbortController();
-    activeAbortCtrl = abortCtrl;
-    const timer = timeoutMs ? setTimeout(() => abortCtrl.abort(), timeoutMs) : undefined;
-    try {
-      const stream = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: {
-          systemInstruction,
-          abortSignal: abortCtrl.signal,
-          ...(level ? { thinkingConfig: { thinkingLevel: level } } : {}),
-        },
-      });
-
-      let receivedAny = false;
-      for await (const chunk of stream) {
-        if (!receivedAny && timer) {
-          clearTimeout(timer);
-        }
-        receivedAny = true;
-        if (clientClosed) break;
-        const c = chunk as GenerateContentResponse;
-        if (c.text) {
-          streamedAnyChunk = true;
-          res.write(`data: ${JSON.stringify({ text: c.text })}\n\n`);
-        }
-      }
-    } finally {
-      if (timer) clearTimeout(timer);
-      if (activeAbortCtrl === abortCtrl) {
-        activeAbortCtrl = null;
-      }
-    }
-  };
-
-  try {
-    let completed = false;
-    if (ai) {
-      for (const candidate of UPSTREAM_MODEL_CHAIN) {
-        if (clientClosed) break;
-        try {
-          await runStream(
-            candidate.model,
-            candidate.useThinking ? thinkingLevel : null,
-            outputMode === 'build' ? 30000 : 12000,
-          );
-          if (streamedAnyChunk) {
-            completed = true;
-            break;
-          }
-        } catch (upstreamErr) {
-          if (clientClosed || streamedAnyChunk) break;
-          if (!isTransientUpstreamError(upstreamErr)) {
-            throw upstreamErr;
-          }
-        }
-      }
-    }
-
-    if (!completed && !clientClosed && !streamedAnyChunk) {
-      await streamLocalQoweFallback();
+    for (let i = 0; i < responseText.length; i += chunkSize) {
+      if (clientClosed || res.writableEnded) break;
+      res.write(`data: ${JSON.stringify({ text: responseText.slice(i, i + chunkSize) })}\n\n`);
     }
 
     if (!clientClosed && !res.writableEnded) {
@@ -533,18 +257,13 @@ Understand the user's underlying intent deeply before responding. For reasoning,
     }
   } catch (err) {
     if (!clientClosed && !res.writableEnded) {
-      if (!streamedAnyChunk) {
-        await streamLocalQoweFallback();
-        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-      } else {
-        res.write(`data: ${JSON.stringify({ error: formatUpstreamError(err) })}\n\n`);
-      }
+      res.write(`data: ${JSON.stringify({ error: formatServerError(err) })}\n\n`);
       res.end();
     }
   }
 });
 
-app.post('/api/generate-image', async (req, res) => {
+app.post('/api/generate-image', (req, res) => {
   const { prompt, aspectRatio } = (req.body ?? {}) as {
     prompt?: string;
     aspectRatio?: '1:1' | '16:9' | '9:16';
@@ -556,26 +275,16 @@ app.post('/api/generate-image', async (req, res) => {
 
   const safeRatio = aspectRatio === '16:9' || aspectRatio === '9:16' ? aspectRatio : '1:1';
   const cleanPrompt = prompt.trim().slice(0, 1000);
-  try {
-    const ai = createGeminiClient();
-    const result = await generateStudioImageSvg(ai, cleanPrompt, safeRatio);
-    res.json({
-      model: 'qowe-1.0-vision',
-      ...result,
-      mimeType: 'image/svg+xml',
-    });
-  } catch {
-    const dims = getDimensionsForRatio(safeRatio);
-    res.json({
-      model: 'qowe-1.0-vision',
-      svg: sanitizeGeneratedSvg('', cleanPrompt),
-      ...dims,
-      mimeType: 'image/svg+xml',
-    });
-  }
+  const dims = getDimensionsForRatio(safeRatio);
+  res.json({
+    model: 'qowe-1.0-vision',
+    svg: sanitizeGeneratedSvg('', cleanPrompt),
+    ...dims,
+    mimeType: 'image/svg+xml',
+  });
 });
 
-app.post('/api/generate-video', async (req, res) => {
+app.post('/api/generate-video', (req, res) => {
   const { prompt, aspectRatio, durationSec } = (req.body ?? {}) as {
     prompt?: string;
     aspectRatio?: '16:9' | '1:1';
@@ -589,28 +298,18 @@ app.post('/api/generate-video', async (req, res) => {
   const safeRatio = aspectRatio === '1:1' ? '1:1' : '16:9';
   const safeDur = typeof durationSec === 'number' ? durationSec : 4;
   const cleanPrompt = prompt.trim().slice(0, 1000);
-  try {
-    const ai = createGeminiClient();
-    const sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, safeRatio, safeDur);
-    res.json({
-      model: 'qowe-1.0-video',
-      fps: 60,
-      sceneSpec,
-    });
-  } catch {
-    const fallbackSpec = normalizeVideoSceneSpec(null, cleanPrompt);
-    fallbackSpec.aspectRatio = safeRatio;
-    fallbackSpec.durationSec = Math.max(2, Math.min(10, Math.round(safeDur)));
-    res.json({
-      model: 'qowe-1.0-video',
-      fps: 60,
-      sceneSpec: fallbackSpec,
-    });
-  }
+  const sceneSpec: VideoSceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
+  sceneSpec.aspectRatio = safeRatio;
+  sceneSpec.durationSec = Math.max(2, Math.min(10, Math.round(safeDur)));
+  res.json({
+    model: 'qowe-1.0-video',
+    fps: 60,
+    sceneSpec,
+  });
 });
 
-// ---- Studio Same-Origin API Playground Bridge (avoids Authorization Bearer proxy conflicts) ----
-app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
+// ---- Studio Same-Origin API Playground Bridge ----
+app.post('/api/playground/test', requireQoweApiKey, (req, res) => {
   const { endpoint, prompt } = (req.body ?? {}) as {
     endpoint?: string;
     prompt?: string;
@@ -619,29 +318,7 @@ app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
   if (endpoint === 'models') {
     res.json({
       object: 'list',
-      data: [
-        {
-          id: 'qowe-1.0-ultra',
-          object: 'model',
-          owned_by: 'qowe',
-          capabilities: ['chat', 'reasoning', 'code', 'build'],
-          parameters: '801.32B',
-        },
-        {
-          id: 'qowe-1.0-vision',
-          object: 'model',
-          owned_by: 'qowe',
-          capabilities: ['text-to-image'],
-          format: 'image/svg+xml',
-        },
-        {
-          id: 'qowe-1.0-video',
-          object: 'model',
-          owned_by: 'qowe',
-          capabilities: ['text-to-video'],
-          fps: 60,
-        },
-      ],
+      data: QOWE_MODELS_LIST,
     });
     return;
   }
@@ -653,59 +330,28 @@ app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
     return;
   }
 
-  let ai: GoogleGenAI | null = null;
-  try {
-    ai = createGeminiClient();
-  } catch {
-    ai = null;
-  }
-
   const cleanPrompt = prompt.trim().slice(0, 1000);
   if (endpoint === 'image') {
-    try {
-      if (!ai) throw new Error('local fallback');
-      const result = await generateStudioImageSvg(ai, cleanPrompt, '1:1');
-      res.json({
-        created: Math.floor(Date.now() / 1000),
-        model: 'qowe-1.0-vision',
-        data: [
-          {
-            prompt: cleanPrompt,
-            mime_type: 'image/svg+xml',
-            width: result.width,
-            height: result.height,
-            svg: result.svg,
-          },
-        ],
-      });
-    } catch {
-      res.json({
-        created: Math.floor(Date.now() / 1000),
-        model: 'qowe-1.0-vision',
-        data: [
-          {
-            prompt: cleanPrompt,
-            mime_type: 'image/svg+xml',
-            width: 1024,
-            height: 1024,
-            svg: sanitizeGeneratedSvg('', cleanPrompt),
-          },
-        ],
-      });
-    }
+    res.json({
+      created: Math.floor(Date.now() / 1000),
+      model: 'qowe-1.0-vision',
+      data: [
+        {
+          prompt: cleanPrompt,
+          mime_type: 'image/svg+xml',
+          width: 1024,
+          height: 1024,
+          svg: sanitizeGeneratedSvg('', cleanPrompt),
+        },
+      ],
+    });
     return;
   }
 
   if (endpoint === 'video') {
-    let sceneSpec: VideoSceneSpec;
-    try {
-      if (!ai) throw new Error('local fallback');
-      sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, '16:9', 4);
-    } catch {
-      sceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
-      sceneSpec.aspectRatio = '16:9';
-      sceneSpec.durationSec = 4;
-    }
+    const sceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
+    sceneSpec.aspectRatio = '16:9';
+    sceneSpec.durationSec = 4;
     res.json({
       id: `vid_${crypto.randomBytes(10).toString('hex')}`,
       created: Math.floor(Date.now() / 1000),
@@ -718,26 +364,9 @@ app.post('/api/playground/test', requireQoweApiKey, async (req, res) => {
     return;
   }
 
-  let contentText = '';
-  try {
-    if (!ai) throw new Error('local fallback');
-    const response = await generateWithHydrogenFallback((upstreamModel, useThinking) =>
-      ai.models.generateContent({
-        model: upstreamModel,
-        contents: [{ role: 'user', parts: [{ text: cleanPrompt }] }],
-        config: {
-          systemInstruction:
-            'You are Qowe 1.0 Ultra (801.32B parameter multimodal causal transformer). Provide clear, accurate, well-structured responses.',
-          ...(useThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } } : {}),
-        },
-      }),
-    );
-    contentText = response.text ?? '';
-  } catch {
-    contentText = generateLocalQoweResponse({
-      messages: [{ role: 'user', content: cleanPrompt }],
-    });
-  }
+  const contentText = generateQoweAssistantResponse({
+    messages: [{ role: 'user', content: cleanPrompt }],
+  });
 
   res.json({
     id: `chatcmpl-${crypto.randomBytes(10).toString('hex')}`,
@@ -771,6 +400,7 @@ app.get('/api/v1/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'qowe-1.0-api',
+    engine: 'qowe-1.0-self-hosted',
     version: '1.0',
     authHeaders: ['x-api-key', 'x-qowe-api-key', 'Authorization: Bearer'],
   });
@@ -779,33 +409,11 @@ app.get('/api/v1/health', (_req, res) => {
 app.get('/api/v1/models', requireQoweApiKey, (_req, res) => {
   res.json({
     object: 'list',
-    data: [
-      {
-        id: 'qowe-1.0-ultra',
-        object: 'model',
-        owned_by: 'qowe',
-        capabilities: ['chat', 'reasoning', 'code', 'build'],
-        parameters: '801.32B',
-      },
-      {
-        id: 'qowe-1.0-vision',
-        object: 'model',
-        owned_by: 'qowe',
-        capabilities: ['text-to-image'],
-        format: 'image/svg+xml',
-      },
-      {
-        id: 'qowe-1.0-video',
-        object: 'model',
-        owned_by: 'qowe',
-        capabilities: ['text-to-video'],
-        fps: 60,
-      },
-    ],
+    data: QOWE_MODELS_LIST,
   });
 });
 
-app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
+app.post('/api/v1/chat/completions', requireQoweApiKey, (req, res) => {
   const { model, messages, stream, reasoning_effort } = (req.body ?? {}) as {
     model?: string;
     messages?: IncomingMessage[];
@@ -820,39 +428,27 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
     return;
   }
 
-  let ai: GoogleGenAI | null = null;
-  try {
-    ai = createGeminiClient();
-  } catch {
-    ai = null;
-  }
-
-  const systemParts = messages
-    .filter((m) => m.role === 'system' && typeof m.content === 'string')
-    .map((m) => m.content);
-  const systemInstruction =
-    systemParts.join('\n\n') ||
-    'You are Qowe 1.0 Ultra (801.32B parameter multimodal causal transformer). Provide clear, accurate, well-structured responses.';
-
-  const chatContents = messages
-    .filter((m) => m.role !== 'system' && typeof m.content === 'string' && m.content.trim())
-    .map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    }));
-
-  if (chatContents.length === 0) {
+  const chatMessages = messages.filter(
+    (m) => m && typeof m.content === 'string' && m.content.trim().length > 0,
+  );
+  if (chatMessages.length === 0) {
     res.status(400).json({
-      error: { message: 'At least one user or assistant message with content is required.', type: 'invalid_request_error' },
+      error: {
+        message: 'At least one message with non-empty content is required.',
+        type: 'invalid_request_error',
+      },
     });
     return;
   }
 
-  const thinkingLevel =
-    reasoning_effort === 'standard' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH;
-  const responseModelName = typeof model === 'string' && model.trim() ? model.trim() : 'qowe-1.0-ultra';
+  const responseModelName =
+    typeof model === 'string' && model.trim() ? model.trim() : 'qowe-1.0-ultra';
   const completionId = `chatcmpl-${crypto.randomBytes(10).toString('hex')}`;
   const created = Math.floor(Date.now() / 1000);
+  const contentText = generateQoweAssistantResponse({
+    messages: chatMessages,
+    reasoningDepth: reasoning_effort === 'standard' ? 'standard' : 'deep',
+  });
 
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -860,95 +456,31 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    let clientClosed = false;
-    let sentAny = false;
-    const abortCtrl = new AbortController();
-    res.on('close', () => {
-      if (!res.writableEnded) {
-        clientClosed = true;
-        abortCtrl.abort();
-      }
-    });
-
-    try {
-      if (!ai) throw new Error('local fallback');
-      const streamResp = await generateWithHydrogenFallback((upstreamModel, useThinking) =>
-        ai.models.generateContentStream({
-          model: upstreamModel,
-          contents: chatContents,
-          config: {
-            systemInstruction,
-            abortSignal: abortCtrl.signal,
-            ...(useThinking ? { thinkingConfig: { thinkingLevel } } : {}),
-          },
-        }),
-      );
-
-      for await (const chunk of streamResp) {
-        if (clientClosed) break;
-        const c = chunk as GenerateContentResponse;
-        if (c.text) {
-          sentAny = true;
-          res.write(
-            `data: ${JSON.stringify({
-              id: completionId,
-              object: 'chat.completion.chunk',
-              created,
-              model: responseModelName,
-              choices: [{ index: 0, delta: { content: c.text }, finish_reason: null }],
-            })}\n\n`,
-          );
-        }
-      }
-    } catch {
-      // Fall through to local fallback below if nothing streamed yet
-    }
-
-    if (!sentAny && !clientClosed && !res.writableEnded) {
-      const localText = generateLocalQoweResponse({ messages });
+    const chunkSize = 48;
+    for (let i = 0; i < contentText.length; i += chunkSize) {
       res.write(
         `data: ${JSON.stringify({
           id: completionId,
           object: 'chat.completion.chunk',
           created,
           model: responseModelName,
-          choices: [{ index: 0, delta: { content: localText }, finish_reason: null }],
+          choices: [{ index: 0, delta: { content: contentText.slice(i, i + chunkSize) }, finish_reason: null }],
         })}\n\n`,
       );
     }
 
-    if (!clientClosed && !res.writableEnded) {
-      res.write(
-        `data: ${JSON.stringify({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model: responseModelName,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        })}\n\n`,
-      );
-      res.write('data: [DONE]\n\n');
-      res.end();
-    }
-    return;
-  }
-
-  let contentText = '';
-  try {
-    if (!ai) throw new Error('local fallback');
-    const response = await generateWithHydrogenFallback((upstreamModel, useThinking) =>
-      ai.models.generateContent({
-        model: upstreamModel,
-        contents: chatContents,
-        config: {
-          systemInstruction,
-          ...(useThinking ? { thinkingConfig: { thinkingLevel } } : {}),
-        },
-      }),
+    res.write(
+      `data: ${JSON.stringify({
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model: responseModelName,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      })}\n\n`,
     );
-    contentText = response.text ?? '';
-  } catch {
-    contentText = generateLocalQoweResponse({ messages });
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
   }
 
   res.json({
@@ -964,16 +496,16 @@ app.post('/api/v1/chat/completions', requireQoweApiKey, async (req, res) => {
       },
     ],
     usage: {
-      prompt_tokens: Math.ceil(JSON.stringify(chatContents).length / 4),
+      prompt_tokens: Math.ceil(JSON.stringify(chatMessages).length / 4),
       completion_tokens: Math.ceil(contentText.length / 4),
       total_tokens:
-        Math.ceil(JSON.stringify(chatContents).length / 4) +
+        Math.ceil(JSON.stringify(chatMessages).length / 4) +
         Math.ceil(contentText.length / 4),
     },
   });
 });
 
-app.post('/api/v1/images/generations', requireQoweApiKey, async (req, res) => {
+app.post('/api/v1/images/generations', requireQoweApiKey, (req, res) => {
   const { prompt, aspect_ratio } = (req.body ?? {}) as {
     prompt?: string;
     aspect_ratio?: '1:1' | '16:9' | '9:16';
@@ -987,14 +519,9 @@ app.post('/api/v1/images/generations', requireQoweApiKey, async (req, res) => {
 
   const safeRatio = aspect_ratio === '16:9' || aspect_ratio === '9:16' ? aspect_ratio : '1:1';
   const cleanPrompt = prompt.trim().slice(0, 1000);
-  let result: { svg: string; width: number; height: number };
-  try {
-    const ai = createGeminiClient();
-    result = await generateStudioImageSvg(ai, cleanPrompt, safeRatio);
-  } catch {
-    const dims = getDimensionsForRatio(safeRatio);
-    result = { svg: sanitizeGeneratedSvg('', cleanPrompt), ...dims };
-  }
+  const dims = getDimensionsForRatio(safeRatio);
+  const svg = sanitizeGeneratedSvg('', cleanPrompt);
+
   res.json({
     created: Math.floor(Date.now() / 1000),
     model: 'qowe-1.0-vision',
@@ -1002,16 +529,16 @@ app.post('/api/v1/images/generations', requireQoweApiKey, async (req, res) => {
       {
         prompt: prompt.trim(),
         mime_type: 'image/svg+xml',
-        width: result.width,
-        height: result.height,
-        svg: result.svg,
-        b64_json: Buffer.from(result.svg, 'utf8').toString('base64'),
+        width: dims.width,
+        height: dims.height,
+        svg,
+        b64_json: Buffer.from(svg, 'utf8').toString('base64'),
       },
     ],
   });
 });
 
-app.post('/api/v1/videos/generations', requireQoweApiKey, async (req, res) => {
+app.post('/api/v1/videos/generations', requireQoweApiKey, (req, res) => {
   const { prompt, aspect_ratio, duration_sec } = (req.body ?? {}) as {
     prompt?: string;
     aspect_ratio?: '16:9' | '1:1';
@@ -1027,15 +554,10 @@ app.post('/api/v1/videos/generations', requireQoweApiKey, async (req, res) => {
   const safeRatio = aspect_ratio === '1:1' ? '1:1' : '16:9';
   const safeDur = typeof duration_sec === 'number' ? duration_sec : 4;
   const cleanPrompt = prompt.trim().slice(0, 1000);
-  let sceneSpec: VideoSceneSpec;
-  try {
-    const ai = createGeminiClient();
-    sceneSpec = await generateVideoSceneSpec(ai, cleanPrompt, safeRatio, safeDur);
-  } catch {
-    sceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
-    sceneSpec.aspectRatio = safeRatio;
-    sceneSpec.durationSec = Math.max(2, Math.min(10, Math.round(safeDur)));
-  }
+  const sceneSpec = normalizeVideoSceneSpec(null, cleanPrompt);
+  sceneSpec.aspectRatio = safeRatio;
+  sceneSpec.durationSec = Math.max(2, Math.min(10, Math.round(safeDur)));
+
   res.json({
     id: `vid_${crypto.randomBytes(10).toString('hex')}`,
     created: Math.floor(Date.now() / 1000),

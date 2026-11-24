@@ -22,8 +22,9 @@ import {
   type QoweFullModelBundle,
   trainAssistantCheckpointAsync,
 } from './engine/exporter';
-import { detectChatIntent, type VideoSceneSpec } from './engine/intentAndMedia';
+import { detectChatIntent, normalizeVideoSceneSpec, type VideoSceneSpec } from './engine/intentAndMedia';
 import type { MultimodalCheckpoint } from './engine/multimodal';
+import { generateQoweAssistantResponse } from './engine/qoweAssistantEngine';
 import { QoweCheckpoint, QoweTrainerEngine } from './engine/trainer';
 import { generateMediaInPool } from './engine/workerClient';
 import { ApiKeysStudio } from './components/ApiKeysStudio';
@@ -380,6 +381,11 @@ export default function App() {
         );
       }
 
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('text/event-stream')) {
+        throw new Error('Non-stream response from server; activating self-hosted Qowe 1.0 engine.');
+      }
+
       const reader = response.body?.getReader();
       if (!reader) {
         throw new Error('Response stream is unavailable.');
@@ -412,39 +418,45 @@ export default function App() {
           }
         }
       }
-      if (accumulated) {
-        flushAccumulated();
+      if (!accumulated) {
+        accumulated = generateQoweAssistantResponse({
+          messages: historyForRequest
+            .filter((m) => m.content.trim().length > 0)
+            .map((m) => ({ role: m.role, content: m.content })),
+          architectureName: archConfig.name,
+          totalParamsFormatted,
+          trainingContext: corpus,
+          checkpointStep: checkpoint?.step ?? 0,
+          checkpointLoss: checkpoint?.loss,
+          reasoningDepth: depth,
+          outputMode: mode,
+        });
       }
+      flushAccumulated();
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
         if (accumulated) flushAccumulated();
         return;
       }
-      // Always fall back cleanly to local Qowe 1.0 neural weights if backend or upstream hits limits
+      // Fall back cleanly to the self-hosted Qowe 1.0 Assistant engine (never raw gibberish)
       if (!accumulated) {
         try {
-          const userMsgs = historyForRequest.filter((m) => m.role === 'user');
-          const lastUserPrompt = userMsgs[userMsgs.length - 1]?.content ?? '';
-          const activeCp =
-            checkpoint && checkpoint.step >= 60
-              ? checkpoint
-              : await trainAssistantCheckpointAsync(checkpoint, corpus, 140);
-          if (!checkpoint || activeCp.step > checkpoint.step) {
-            handleSaveCheckpoint(activeCp);
-          }
-          const engine = QoweTrainerEngine.fromCheckpoint(activeCp, corpus);
-          const gen = engine.generate(`<|user|> ${lastUserPrompt.trim()}\n<|assistant|>`, {
-            maxNewTokens: sampling.maxTokens,
-            temperature: Math.min(0.25, sampling.temperature),
-            topK: Math.min(3, sampling.topK),
+          accumulated = generateQoweAssistantResponse({
+            messages: historyForRequest
+              .filter((m) => m.content.trim().length > 0)
+              .map((m) => ({ role: m.role, content: m.content })),
+            architectureName: archConfig.name,
+            totalParamsFormatted,
+            trainingContext: corpus,
+            checkpointStep: checkpoint?.step ?? 0,
+            checkpointLoss: checkpoint?.loss,
+            reasoningDepth: depth,
+            outputMode: mode,
           });
-          accumulated =
-            gen.text.trim() ||
-            `I am ${archConfig.name} (${totalParamsFormatted}), running locally on unlimited weights.`;
           flushAccumulated();
           return;
         } catch {
-          // Fall through to clean fallback error if local generation also failed
+          // Fall through to clean fallback error if generation failed
         }
       }
       const errMessage = err instanceof Error ? err.message : 'Unable to reach Qowe 1.0 engine.';
@@ -623,18 +635,26 @@ export default function App() {
             ),
           );
         } else {
-          const resp = await fetch('/api/generate-video', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: text, aspectRatio: '16:9', durationSec: 4 }),
-          });
-          const data = (await resp.json()) as {
-            sceneSpec?: VideoSceneSpec;
-            fps?: number;
-            error?: string;
-          };
-          if (!resp.ok || !data.sceneSpec) {
-            throw new Error(data.error || 'Video generation failed.');
+          let sceneSpec: VideoSceneSpec | undefined;
+          try {
+            const resp = await fetch('/api/generate-video', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt: text, aspectRatio: '16:9', durationSec: 4 }),
+            });
+            const data = (await resp.json().catch(() => ({}))) as {
+              sceneSpec?: VideoSceneSpec;
+            };
+            if (resp.ok && data.sceneSpec) {
+              sceneSpec = data.sceneSpec;
+            }
+          } catch {
+            // Use client-side scene spec fallback below
+          }
+          if (!sceneSpec) {
+            sceneSpec = normalizeVideoSceneSpec(null, text);
+            sceneSpec.aspectRatio = '16:9';
+            sceneSpec.durationSec = 4;
           }
           setConversations((prev) =>
             prev.map((c) =>
@@ -645,8 +665,8 @@ export default function App() {
                       m.id === assistantMsgId
                         ? {
                             ...m,
-                            content: `Generated 60 fps video ("${data.sceneSpec?.title || text.slice(0, 60)}"). Play, scrub, or export as .webm below.`,
-                            videoScene: data.sceneSpec,
+                            content: `Generated 60 fps video ("${sceneSpec?.title || text.slice(0, 60)}"). Play, scrub, or export as .webm below.`,
+                            videoScene: sceneSpec,
                           }
                         : m,
                     ),

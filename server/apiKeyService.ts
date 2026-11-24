@@ -51,14 +51,63 @@ function toPublicRecord(rec: QoweApiKeyRecord): PublicQoweApiKeyRecord {
   };
 }
 
+export interface QoweKeyStoreOptions {
+  allowStatelessSigned?: boolean;
+  signingSecret?: string;
+}
+
 export class QoweApiKeyStore {
   private readonly filePath: string;
+  private readonly allowStatelessSigned: boolean;
+  private readonly signingSecret: string;
   private records: QoweApiKeyRecord[] = [];
   private loaded = false;
   private writeChain: Promise<void> = Promise.resolve();
 
-  constructor(storeFilePath?: string) {
+  constructor(storeFilePath?: string, options?: QoweKeyStoreOptions) {
     this.filePath = storeFilePath ?? path.resolve(process.cwd(), '.qowe-keys.json');
+    this.allowStatelessSigned = Boolean(options?.allowStatelessSigned);
+    this.signingSecret =
+      options?.signingSecret ||
+      process.env.QOWE_KEY_SECRET ||
+      process.env.SITE_ID ||
+      'qowe-1.0-self-hosted-signing-secret';
+  }
+
+  private signNonce(nonceHex: string): string {
+    return crypto
+      .createHmac('sha256', this.signingSecret)
+      .update(nonceHex, 'utf8')
+      .digest('hex')
+      .slice(0, 16);
+  }
+
+  private verifySignedStatelessKey(rawKey: string): PublicQoweApiKeyRecord | null {
+    if (!this.allowStatelessSigned) return null;
+    if (!rawKey.startsWith(KEY_PREFIX)) return null;
+    const body = rawKey.slice(KEY_PREFIX.length);
+    const parts = body.split('_');
+    if (parts.length !== 2) return null;
+    const [nonceHex, providedSig] = parts;
+    if (!/^[a-f0-9]{24}$/i.test(nonceHex) || !/^[a-f0-9]{16}$/i.test(providedSig)) {
+      return null;
+    }
+    const expectedSig = this.signNonce(nonceHex);
+    const a = Buffer.from(providedSig, 'hex');
+    const b = Buffer.from(expectedSig, 'hex');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return null;
+    }
+    return {
+      id: `key_${nonceHex.slice(0, 16)}`,
+      name: 'Qowe Netlify Key',
+      prefix: `${rawKey.slice(0, 14)}...${rawKey.slice(-4)}`,
+      createdAt: new Date().toISOString(),
+      lastUsedAt: new Date().toISOString(),
+      requestCount: 1,
+      avgLatencyMs: 0,
+      lastLatencyMs: null,
+    };
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -86,12 +135,16 @@ export class QoweApiKeyStore {
   private async persist(): Promise<void> {
     const snapshot = JSON.stringify(this.records, null, 2);
     this.writeChain = this.writeChain.then(async () => {
-      const dir = path.dirname(this.filePath);
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(this.filePath, snapshot, {
-        encoding: 'utf8',
-        mode: 0o600,
-      });
+      try {
+        const dir = path.dirname(this.filePath);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(this.filePath, snapshot, {
+          encoding: 'utf8',
+          mode: 0o600,
+        });
+      } catch {
+        // Non-fatal in read-only environments
+      }
     });
     await this.writeChain;
   }
@@ -111,8 +164,14 @@ export class QoweApiKeyStore {
       throw new Error(`Maximum limit of ${MAX_KEYS} active API keys reached. Revoke an unused key first.`);
     }
 
-    const secretHex = crypto.randomBytes(24).toString('hex');
-    const rawKey = `${KEY_PREFIX}${secretHex}`;
+    const rawKey = this.allowStatelessSigned
+      ? (() => {
+          const nonceHex = crypto.randomBytes(12).toString('hex');
+          const sigHex = this.signNonce(nonceHex);
+          return `${KEY_PREFIX}${nonceHex}_${sigHex}`;
+        })()
+      : `${KEY_PREFIX}${crypto.randomBytes(24).toString('hex')}`;
+
     const keyHash = hashQoweApiKey(rawKey);
     const prefix = `${rawKey.slice(0, 14)}...${rawKey.slice(-4)}`;
 
@@ -164,13 +223,14 @@ export class QoweApiKeyStore {
       }
     }
 
-    if (!matched) return null;
+    if (matched) {
+      matched.requestCount += 1;
+      matched.lastUsedAt = new Date().toISOString();
+      void this.persist();
+      return toPublicRecord(matched);
+    }
 
-    matched.requestCount += 1;
-    matched.lastUsedAt = new Date().toISOString();
-    void this.persist();
-
-    return toPublicRecord(matched);
+    return this.verifySignedStatelessKey(rawKey);
   }
 
   async recordLatency(id: string, latencyMs: number): Promise<void> {
